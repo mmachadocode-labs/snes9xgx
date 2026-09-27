@@ -35,8 +35,8 @@ static const xbox_one_device supported[] = {
 };
 
 static s32 deviceId = 0;
-static u8 epIn = 0x81;
-static u8 epOut = 0x01;
+static u8 epIn = 0x82;
+static u8 epOut = 0x02;
 static u16 packetSize = BUF_SIZE;
 static u8 ATTRIBUTE_ALIGN(32) inBuf[BUF_SIZE];
 static bool reading = false;
@@ -309,14 +309,18 @@ static void openController(void)
         }
 
         if (!descriptorOk) {
-            epIn = 0x81;
-            epOut = 0x01;
+            /* Official 045e:02ea interface 0 uses interrupt OUT 0x02 and
+             * interrupt IN 0x82, both 64-byte packets. IOS58 can enumerate
+             * the device while GETDEVPARAMS still returns IPC_EINVAL (-4),
+             * so use the known GIP endpoints as a fallback. */
+            epIn = 0x82;
+            epOut = 0x02;
             packetSize = BUF_SIZE;
             config = 1;
         }
 
-        /* Explicitly request the standard wired GIP configuration/interface.
-         * Keep going even if IOS58 reports that it is already configured. */
+        /* The controller is normally already configured by IOS58. Keep these
+         * calls only as diagnostics; a NAK here is not fatal. */
         s32 configResult = USB_SetConfiguration(fd, config);
         s32 altResult = USB_SetAlternativeInterface(fd, 0, 0);
 
@@ -329,8 +333,8 @@ static void openController(void)
         int firstWrite = initializeController(&secondWrite);
         if (firstWrite < 0 || secondWrite < 0) {
             snprintf(lastDiag, sizeof(lastDiag),
-                     "i%u id:%d d:%d c:%d a:%d w:%d/%d",
-                     i, devices[i].device_id, descResult,
+                     "i%u id:%d ep:%02x/%02x d:%d c:%d a:%d w:%d/%d",
+                     i, devices[i].device_id, epIn, epOut, descResult,
                      configResult, altResult, firstWrite, secondWrite);
             deviceId = 0;
             active = NULL;
@@ -342,8 +346,8 @@ static void openController(void)
         int queueResult = USB_ReadIntrMsgAsync(deviceId, epIn, packetSize, inBuf, &readCallback, NULL);
         if (queueResult < 0) {
             snprintf(lastDiag, sizeof(lastDiag),
-                     "i%u id:%d d:%d c:%d a:%d w:%d/%d q:%d",
-                     i, devices[i].device_id, descResult,
+                     "i%u id:%d ep:%02x/%02x d:%d c:%d a:%d w:%d/%d q:%d",
+                     i, devices[i].device_id, epIn, epOut, descResult,
                      configResult, altResult, firstWrite, secondWrite, queueResult);
             reading = false;
             deviceId = 0;
@@ -354,8 +358,8 @@ static void openController(void)
 
         USB_DeviceRemovalNotifyAsync(fd, &removalCallback, (void *)fd);
         snprintf(statusText, sizeof(statusText),
-                 "OK i%u id:%d d:%d c:%d a:%d w:%d/%d q:%d",
-                 i, devices[i].device_id, descResult,
+                 "OK i%u ep:%02x/%02x d:%d c:%d a:%d w:%d/%d q:%d",
+                 i, epIn, epOut, descResult,
                  configResult, altResult, firstWrite, secondWrite, queueResult);
         return;
     }
