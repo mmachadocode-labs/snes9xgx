@@ -42,7 +42,7 @@ static u8 ATTRIBUTE_ALIGN(32) inBuf[BUF_SIZE];
 static bool reading = false;
 static u32 held = 0;
 static const xbox_one_device *active = NULL;
-static char statusText[64] = "not found";
+static char statusText[96] = "not found";
 static u8 sequence = 0;
 
 static const xbox_one_device *findDevice(u16 vid, u16 pid)
@@ -238,12 +238,12 @@ static int readCallback(int result, void *userdata)
     if (result > 0)
         parseInput(result);
     else if (result < 0)
-        snprintf(statusText, sizeof(statusText), "connected readerr:%d", result);
+        snprintf(statusText, sizeof(statusText), "read cb:%d", result);
 
     int rc = USB_ReadIntrMsgAsync(deviceId, epIn, packetSize, inBuf, &readCallback, NULL);
     if (rc < 0) {
         reading = false;
-        snprintf(statusText, sizeof(statusText), "connected queueerr:%d", rc);
+        snprintf(statusText, sizeof(statusText), "requeue:%d", rc);
     }
 
     return 1;
@@ -278,12 +278,12 @@ static void openController(void)
     }
 
     if (listResult < 0) {
-        snprintf(statusText, sizeof(statusText), "list err:%d", listResult);
+        snprintf(statusText, sizeof(statusText), "list:%d", listResult);
         return;
     }
 
     bool sawSupported = false;
-    int lastError = 0;
+    char lastDiag[96] = "Xbox found";
 
     for (u8 i = 0; i < count; ++i) {
         const xbox_one_device *candidate = findDevice(devices[i].vid, devices[i].pid);
@@ -294,8 +294,7 @@ static void openController(void)
         s32 fd = -1;
         s32 openResult = USB_OpenDevice(devices[i].device_id, devices[i].vid, devices[i].pid, &fd);
         if (openResult < 0) {
-            lastError = openResult;
-            snprintf(statusText, sizeof(statusText), "i%u open:%d", i, openResult);
+            snprintf(lastDiag, sizeof(lastDiag), "i%u id:%d open:%d", i, devices[i].device_id, openResult);
             continue;
         }
 
@@ -306,33 +305,33 @@ static void openController(void)
 
         if (descResult >= 0) {
             descriptorOk = findDataEndpoints(&desc, &config);
-            if (descriptorOk)
-                USB_SetConfiguration(fd, config);
             USB_FreeDescriptors(&desc);
         }
 
         if (!descriptorOk) {
-            /* IOS58 can enumerate 045e:02ea but reject GETDEVPARAMS with
-             * IPC_EINVAL (-4).  Interface 0 of wired Xbox One GIP pads uses
-             * interrupt IN 0x81 / OUT 0x01, 64-byte packets, so try those
-             * known endpoints directly.  IOS exposes the controller's
-             * multiple interfaces as separate device entries; wrong entries
-             * should fail the transfer and we continue to the next one. */
             epIn = 0x81;
             epOut = 0x01;
             packetSize = BUF_SIZE;
+            config = 1;
         }
+
+        /* Explicitly request the standard wired GIP configuration/interface.
+         * Keep going even if IOS58 reports that it is already configured. */
+        s32 configResult = USB_SetConfiguration(fd, config);
+        s32 altResult = USB_SetAlternativeInterface(fd, 0, 0);
 
         deviceId = fd;
         active = candidate;
         held = 0;
         reading = false;
 
-        int second = 0;
-        int first = initializeController(&second);
-        if (first < 0 || second < 0) {
-            lastError = (first < 0) ? first : second;
-            snprintf(statusText, sizeof(statusText), "i%u fb d:%d w:%d/%d", i, descResult, first, second);
+        int secondWrite = 0;
+        int firstWrite = initializeController(&secondWrite);
+        if (firstWrite < 0 || secondWrite < 0) {
+            snprintf(lastDiag, sizeof(lastDiag),
+                     "i%u id:%d d:%d c:%d a:%d w:%d/%d",
+                     i, devices[i].device_id, descResult,
+                     configResult, altResult, firstWrite, secondWrite);
             deviceId = 0;
             active = NULL;
             USB_CloseDevice(&fd);
@@ -342,9 +341,11 @@ static void openController(void)
         reading = true;
         int queueResult = USB_ReadIntrMsgAsync(deviceId, epIn, packetSize, inBuf, &readCallback, NULL);
         if (queueResult < 0) {
-            lastError = queueResult;
+            snprintf(lastDiag, sizeof(lastDiag),
+                     "i%u id:%d d:%d c:%d a:%d w:%d/%d q:%d",
+                     i, devices[i].device_id, descResult,
+                     configResult, altResult, firstWrite, secondWrite, queueResult);
             reading = false;
-            snprintf(statusText, sizeof(statusText), "i%u fb d:%d q:%d", i, descResult, queueResult);
             deviceId = 0;
             active = NULL;
             USB_CloseDevice(&fd);
@@ -352,13 +353,15 @@ static void openController(void)
         }
 
         USB_DeviceRemovalNotifyAsync(fd, &removalCallback, (void *)fd);
-        snprintf(statusText, sizeof(statusText), descriptorOk ?
-                 "connected ep:%02x/%02x" : "connected fb i%u d:%d", epIn, epOut, i, descResult);
+        snprintf(statusText, sizeof(statusText),
+                 "OK i%u id:%d d:%d c:%d a:%d w:%d/%d q:%d",
+                 i, devices[i].device_id, descResult,
+                 configResult, altResult, firstWrite, secondWrite, queueResult);
         return;
     }
 
     if (sawSupported)
-        snprintf(statusText, sizeof(statusText), "Xbox found, last:%d", lastError);
+        snprintf(statusText, sizeof(statusText), "%s", lastDiag);
     else
         snprintf(statusText, sizeof(statusText), "not found (%u USB)", count);
 }
