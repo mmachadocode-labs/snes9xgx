@@ -15,12 +15,9 @@
 #define STICK_THRESHOLD 16384
 #define TRIGGER_THRESHOLD 512
 
-#define GIP_CMD_POWER        0x05
-#define GIP_CMD_AUTHENTICATE 0x06
-#define GIP_CMD_VIRTUAL_KEY  0x07
-#define GIP_CMD_LED          0x0a
-#define GIP_CMD_INPUT        0x20
-#define GIP_OPT_INTERNAL     0x20
+#define GIP_CMD_VIRTUAL_KEY 0x07
+#define GIP_CMD_INPUT       0x20
+#define GIP_OPT_INTERNAL    0x20
 
 typedef struct {
     u16 pid;
@@ -47,7 +44,6 @@ static u32 held = 0;
 static const xbox_one_device *active = NULL;
 static char statusText[64] = "not found";
 static u8 sequence = 0;
-static int lastReadResult = 0;
 
 static const xbox_one_device *findDevice(u16 vid, u16 pid)
 {
@@ -155,33 +151,30 @@ static int sendPacket(const u8 *packet, u8 len)
     return USB_WriteIntrMsg(deviceId, epOut, len, out);
 }
 
-static void initializeController(void)
+/* Match the Linux xpad startup sequence: generic 2015+ power-on, then the
+ * extra Xbox One S packet for 045e:02ea / Elite 2. */
+static int initializeController(int *secondResult)
 {
     static const u8 powerOn[] = {
-        GIP_CMD_POWER, GIP_OPT_INTERNAL, 0x00, 0x01, 0x00
+        0x05, GIP_OPT_INTERNAL, 0x00, 0x01, 0x00
     };
     static const u8 oneSInit[] = {
-        GIP_CMD_POWER, GIP_OPT_INTERNAL, 0x00, 0x0f, 0x06
-    };
-    static const u8 ledOn[] = {
-        GIP_CMD_LED, GIP_OPT_INTERNAL, 0x00, 0x03, 0x00, 0x01, 0x14
-    };
-    static const u8 authDone[] = {
-        GIP_CMD_AUTHENTICATE, GIP_OPT_INTERNAL, 0x00, 0x02, 0x01, 0x00
+        0x05, GIP_OPT_INTERNAL, 0x00, 0x0f, 0x06
     };
 
     sequence = 0;
-    sendPacket(powerOn, sizeof(powerOn));
+    int first = sendPacket(powerOn, sizeof(powerOn));
+    int second = 0;
     usleep(2000);
 
-    if (active && active->needsSInit) {
-        sendPacket(oneSInit, sizeof(oneSInit));
+    if (first >= 0 && active && active->needsSInit) {
+        second = sendPacket(oneSInit, sizeof(oneSInit));
         usleep(2000);
     }
 
-    sendPacket(ledOn, sizeof(ledOn));
-    usleep(2000);
-    sendPacket(authDone, sizeof(authDone));
+    if (secondResult)
+        *secondResult = second;
+    return first;
 }
 
 static void parseInput(int len)
@@ -189,11 +182,15 @@ static void parseInput(int len)
     if (len < 5)
         return;
 
-    if (inBuf[0] == GIP_CMD_VIRTUAL_KEY)
+    if (inBuf[0] == GIP_CMD_VIRTUAL_KEY) {
+        snprintf(statusText, sizeof(statusText), "rx:%d cmd:07", len);
         return;
+    }
 
-    if (inBuf[0] != GIP_CMD_INPUT || len < 18)
+    if (inBuf[0] != GIP_CMD_INPUT || len < 18) {
+        snprintf(statusText, sizeof(statusText), "rx:%d cmd:%02x", len, inBuf[0]);
         return;
+    }
 
     held = 0;
 
@@ -237,8 +234,6 @@ static int readCallback(int result, void *userdata)
 {
     if (!reading || deviceId == 0)
         return 1;
-
-    lastReadResult = result;
 
     if (result > 0)
         parseInput(result);
@@ -287,69 +282,91 @@ static void openController(void)
         return;
     }
 
+    bool sawSupported = false;
+    int lastError = 0;
+
     for (u8 i = 0; i < count; ++i) {
         const xbox_one_device *candidate = findDevice(devices[i].vid, devices[i].pid);
         if (!candidate)
             continue;
 
-        snprintf(statusText, sizeof(statusText), "found %04x:%04x", devices[i].vid, devices[i].pid);
-
+        sawSupported = true;
         s32 fd = -1;
         s32 openResult = USB_OpenDevice(devices[i].device_id, devices[i].vid, devices[i].pid, &fd);
         if (openResult < 0) {
-            snprintf(statusText, sizeof(statusText), "open err:%d", openResult);
+            lastError = openResult;
+            snprintf(statusText, sizeof(statusText), "i%u open:%d", i, openResult);
             continue;
         }
 
+        bool descriptorOk = false;
         usb_devdesc desc;
         s32 descResult = USB_GetDescriptors(fd, &desc);
-        if (descResult < 0) {
-            snprintf(statusText, sizeof(statusText), "desc err:%d", descResult);
-            USB_CloseDevice(&fd);
-            continue;
-        }
-
         u8 config = 1;
-        if (!findDataEndpoints(&desc, &config)) {
-            strcpy(statusText, "endpoint not found");
+
+        if (descResult >= 0) {
+            descriptorOk = findDataEndpoints(&desc, &config);
+            if (descriptorOk)
+                USB_SetConfiguration(fd, config);
             USB_FreeDescriptors(&desc);
-            USB_CloseDevice(&fd);
-            continue;
         }
 
-        /* IOS58 often already owns/configures V5 devices.  Try SET_CONFIGURATION,
-           but do not reject a valid opened device solely because it is already set. */
-        USB_SetConfiguration(fd, config);
+        if (!descriptorOk) {
+            /* IOS58 can enumerate 045e:02ea but reject GETDEVPARAMS with
+             * IPC_EINVAL (-4).  Interface 0 of wired Xbox One GIP pads uses
+             * interrupt IN 0x81 / OUT 0x01, 64-byte packets, so try those
+             * known endpoints directly.  IOS exposes the controller's
+             * multiple interfaces as separate device entries; wrong entries
+             * should fail the transfer and we continue to the next one. */
+            epIn = 0x81;
+            epOut = 0x01;
+            packetSize = BUF_SIZE;
+        }
 
         deviceId = fd;
         active = candidate;
         held = 0;
         reading = false;
-        lastReadResult = 0;
 
-        snprintf(statusText, sizeof(statusText), "connected wait ep:%02x/%02x", epIn, epOut);
-        initializeController();
+        int second = 0;
+        int first = initializeController(&second);
+        if (first < 0 || second < 0) {
+            lastError = (first < 0) ? first : second;
+            snprintf(statusText, sizeof(statusText), "i%u fb d:%d w:%d/%d", i, descResult, first, second);
+            deviceId = 0;
+            active = NULL;
+            USB_CloseDevice(&fd);
+            continue;
+        }
+
+        reading = true;
+        int queueResult = USB_ReadIntrMsgAsync(deviceId, epIn, packetSize, inBuf, &readCallback, NULL);
+        if (queueResult < 0) {
+            lastError = queueResult;
+            reading = false;
+            snprintf(statusText, sizeof(statusText), "i%u fb d:%d q:%d", i, descResult, queueResult);
+            deviceId = 0;
+            active = NULL;
+            USB_CloseDevice(&fd);
+            continue;
+        }
+
         USB_DeviceRemovalNotifyAsync(fd, &removalCallback, (void *)fd);
-        USB_FreeDescriptors(&desc);
+        snprintf(statusText, sizeof(statusText), descriptorOk ?
+                 "connected ep:%02x/%02x" : "connected fb i%u d:%d", epIn, epOut, i, descResult);
         return;
     }
 
-    snprintf(statusText, sizeof(statusText), "not found (%u USB)", count);
+    if (sawSupported)
+        snprintf(statusText, sizeof(statusText), "Xbox found, last:%d", lastError);
+    else
+        snprintf(statusText, sizeof(statusText), "not found (%u USB)", count);
 }
 
 void XBOXONE_ScanPads(void)
 {
     if (deviceId == 0)
-        return;
-
-    if (!reading) {
-        reading = true;
-        int rc = USB_ReadIntrMsgAsync(deviceId, epIn, packetSize, inBuf, &readCallback, NULL);
-        if (rc < 0) {
-            reading = false;
-            snprintf(statusText, sizeof(statusText), "connected queueerr:%d", rc);
-        }
-    }
+        openController();
 }
 
 u32 XBOXONE_ButtonsHeld(int chan)
