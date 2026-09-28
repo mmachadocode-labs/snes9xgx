@@ -4,10 +4,14 @@
  * Wired Xbox One input for Snes9x GX.
  *
  * USB transport/lifetime handling is adapted from Mayo1970/ioQuake3-wii's
- * code/input/wii_usb_hid.c (GPLv2).  In particular: IOS IPC buffers live on
- * a 32-byte-aligned heap, the controller is opened through its IOS58 V5
- * device_id, configuration is left to IOS, hotplug is polled, and an async
- * read callback never closes/reopens a USB device itself.
+ * code/input/wii_usb_hid.c (GPLv2). IOS IPC buffers are 32-byte aligned,
+ * hotplug is polled, and the async read callback never closes/reopens a USB
+ * device itself.
+ *
+ * Xbox One S (045e:02ea) uses a descriptor-less fast path on IOS58. On the
+ * test Wii, USB_GetDescriptors() returns IPC_EINVAL (-4) for this V5 vendor
+ * device even though USB_OpenDevice() succeeds. Its known GIP endpoints are
+ * interrupt IN 0x82 and interrupt OUT 0x02, 64-byte packets.
  */
 
 #include <gccore.h>
@@ -17,6 +21,7 @@
 #include <string.h>
 
 #define MICROSOFT_VID 0x045e
+#define XBOX_ONE_S_PID 0x02ea
 #define USB_CLASS_VENDOR_SPECIFIC 0xff
 #define MAX_USB_DEVICES 16
 #define MAX_REPORT_SIZE 64
@@ -36,15 +41,16 @@ static const xbox_profile profiles[] = {
     { 0x02d1, "Xbox One" },
     { 0x02dd, "Xbox One (2015)" },
     { 0x02e3, "Xbox One Elite" },
-    { 0x02ea, "Xbox One S" },
+    { XBOX_ONE_S_PID, "Xbox One S" },
     { 0x0b12, "Xbox Elite 2" },
     { 0x0b13, "Xbox Series X/S" },
 };
 
 static bool initialized = false;
-static bool active = false;
+static volatile bool active = false;
 static volatile bool closePending = false;
 static volatile s32 asyncError = 0;
+/* IOS58 V5 vendor device IDs are valid negative numbers. -1 is only our sentinel. */
 static volatile s32 deviceFd = -1;
 static const xbox_profile *activeProfile = NULL;
 static u8 endpointIn = 0;
@@ -150,7 +156,8 @@ static s32 readCallback(s32 result, void *userdata)
     if (result > 0)
         parseXboxOneReport(reportBuffer, (u16)result);
 
-    if (deviceFd >= 0) {
+    /* V5 vendor IDs are negative, so never test deviceFd >= 0 here. */
+    if (active && deviceFd != -1) {
         s32 rc = USB_ReadIntrMsgAsync(deviceFd, endpointIn, reportLength,
                                       reportBuffer, readCallback, NULL);
         if (rc < 0) {
@@ -164,12 +171,13 @@ static s32 readCallback(s32 result, void *userdata)
 static void closeController(void)
 {
     s32 fd = deviceFd;
+    active = false;
     deviceFd = -1; /* callback sees invalid fd before the blocking close */
 
-    if (fd >= 0)
+    /* Negative IOS58 V5 vendor IDs are valid handles. */
+    if (fd != -1)
         USB_CloseDevice(&fd);
 
-    active = false;
     activeProfile = NULL;
     endpointIn = endpointOut = 0;
     heldButtons = 0;
@@ -259,51 +267,60 @@ static bool tryOpen(const usb_device_entry *entry)
     if (!profile)
         return false;
 
-    /* IOS IPC descriptor storage must also be heap-aligned. */
-    usb_devdesc *dd = (usb_devdesc *)memalign(32, sizeof(usb_devdesc));
-    if (!dd) {
-        snprintf(statusText, sizeof(statusText), "alloc desc failed");
-        return false;
-    }
-    memset(dd, 0, sizeof(*dd));
-
     s32 fd = -1;
     s32 rc = USB_OpenDevice(entry->device_id, entry->vid, entry->pid, &fd);
     if (rc < 0) {
         snprintf(statusText, sizeof(statusText), "open:%d %04x:%04x",
                  rc, entry->vid, entry->pid);
-        free(dd);
         return false;
     }
 
-    rc = USB_GetDescriptors(fd, dd);
-    if (rc < 0) {
-        snprintf(statusText, sizeof(statusText), "desc:%d %04x:%04x",
-                 rc, entry->vid, entry->pid);
-        USB_CloseDevice(&fd);
+    u8 inEp = 0;
+    u8 outEp = 0;
+    bool directPath = entry->vid == MICROSOFT_VID && entry->pid == XBOX_ONE_S_PID;
+
+    if (directPath) {
+        /* Known descriptor for 045e:02ea: interface 0 GIP data endpoints. */
+        inEp = 0x82;
+        outEp = 0x02;
+    } else {
+        /* Other models still use descriptor discovery. Descriptor storage is
+         * heap aligned because it participates in IOS IPC. */
+        usb_devdesc *dd = (usb_devdesc *)memalign(32, sizeof(usb_devdesc));
+        if (!dd) {
+            snprintf(statusText, sizeof(statusText), "alloc desc failed");
+            USB_CloseDevice(&fd);
+            return false;
+        }
+        memset(dd, 0, sizeof(*dd));
+
+        rc = USB_GetDescriptors(fd, dd);
+        if (rc < 0) {
+            snprintf(statusText, sizeof(statusText), "desc:%d %04x:%04x",
+                     rc, entry->vid, entry->pid);
+            USB_CloseDevice(&fd);
+            free(dd);
+            return false;
+        }
+
+        bool endpointsOk = findEndpoints(dd, &inEp, &outEp);
+        USB_FreeDescriptors(dd);
         free(dd);
-        return false;
-    }
 
-    u8 inEp = 0, outEp = 0;
-    bool endpointsOk = findEndpoints(dd, &inEp, &outEp);
-    USB_FreeDescriptors(dd);
-    free(dd);
-
-    if (!endpointsOk || !inEp || !outEp) {
-        snprintf(statusText, sizeof(statusText), "no endpoints %04x:%04x",
-                 entry->vid, entry->pid);
-        USB_CloseDevice(&fd);
-        return false;
+        if (!endpointsOk || !inEp || !outEp) {
+            snprintf(statusText, sizeof(statusText), "no endpoints %04x:%04x",
+                     entry->vid, entry->pid);
+            USB_CloseDevice(&fd);
+            return false;
+        }
     }
 
     /* Do NOT call USB_SetConfiguration/USB_SetAlternativeInterface here.
-     * IOS58 already configured the real device; ioQuake3-wii found that Xbox
-     * One and DS4 reject those calls. */
+     * IOS58 already configured the V5 device. */
     rc = initializeXboxOne(fd, outEp);
     if (rc < 0) {
-        snprintf(statusText, sizeof(statusText), "init:%d ep:%02x/%02x",
-                 rc, inEp, outEp);
+        snprintf(statusText, sizeof(statusText), "%s init:%d ep:%02x/%02x",
+                 directPath ? "direct" : "desc", rc, inEp, outEp);
         USB_CloseDevice(&fd);
         return false;
     }
@@ -323,14 +340,15 @@ static bool tryOpen(const usb_device_entry *entry)
     rc = USB_ReadIntrMsgAsync(deviceFd, endpointIn, reportLength,
                               reportBuffer, readCallback, NULL);
     if (rc < 0) {
-        snprintf(statusText, sizeof(statusText), "readq:%d ep:%02x/%02x",
-                 rc, endpointIn, endpointOut);
+        snprintf(statusText, sizeof(statusText), "%s readq:%d ep:%02x/%02x",
+                 directPath ? "direct" : "desc", rc, endpointIn, endpointOut);
         closeController();
         return false;
     }
 
-    snprintf(statusText, sizeof(statusText), "connected %s ep:%02x/%02x",
-             profile->name, endpointIn, endpointOut);
+    snprintf(statusText, sizeof(statusText), "%s connected %s ep:%02x/%02x",
+             directPath ? "direct" : "desc", profile->name,
+             endpointIn, endpointOut);
     return true;
 }
 
