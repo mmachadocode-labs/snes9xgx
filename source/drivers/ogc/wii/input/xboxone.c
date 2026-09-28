@@ -1,449 +1,434 @@
 #ifdef HW_RVL
 
+/*
+ * Wired Xbox One input for Snes9x GX.
+ *
+ * USB transport/lifetime handling is adapted from Mayo1970/ioQuake3-wii's
+ * code/input/wii_usb_hid.c (GPLv2).  In particular: IOS IPC buffers live on
+ * a 32-byte-aligned heap, the controller is opened through its IOS58 V5
+ * device_id, configuration is left to IOS, hotplug is polled, and an async
+ * read callback never closes/reopens a USB device itself.
+ */
+
 #include <gccore.h>
 #include <ogc/usb.h>
 #include <malloc.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
-#define MS_VID 0x045e
-#define GIP_CLASS 0xff
-#define MAX_USB_DEVICES 32
-#define BUF_SIZE 64
+#define MICROSOFT_VID 0x045e
+#define USB_CLASS_VENDOR_SPECIFIC 0xff
+#define MAX_USB_DEVICES 16
+#define MAX_REPORT_SIZE 64
+#define POLL_INTERVAL_FRAMES 60
 #define STICK_THRESHOLD 16384
-#define TRIGGER_THRESHOLD 512
-#define USB_NAK -7005
+#define TRIGGER_THRESHOLD 128
 
-#define GIP_CMD_VIRTUAL_KEY 0x07
 #define GIP_CMD_INPUT       0x20
-#define GIP_OPT_INTERNAL    0x20
+#define GIP_CMD_VIRTUAL_KEY 0x07
 
 typedef struct {
     u16 pid;
-    bool needsSInit;
-} xbox_one_device;
+    const char *name;
+} xbox_profile;
 
-static const xbox_one_device supported[] = {
-    { 0x02d1, false }, /* Xbox One */
-    { 0x02dd, false }, /* Xbox One, 2015 firmware */
-    { 0x02e3, false }, /* Xbox One Elite */
-    { 0x02ea, true  }, /* Xbox One S */
-    { 0x0b00, true  }, /* Elite Series 2 */
-    { 0x0b0a, false }, /* Adaptive Controller */
-    { 0x0b12, false }, /* Series S|X */
+static const xbox_profile profiles[] = {
+    { 0x02d1, "Xbox One" },
+    { 0x02dd, "Xbox One (2015)" },
+    { 0x02e3, "Xbox One Elite" },
+    { 0x02ea, "Xbox One S" },
+    { 0x0b12, "Xbox Elite 2" },
+    { 0x0b13, "Xbox Series X/S" },
 };
 
-static s32 deviceId = 0;
-static u8 epIn = 0x82;
-static u8 epOut = 0x02;
-static u16 packetSize = BUF_SIZE;
-static u8 ATTRIBUTE_ALIGN(32) inBuf[BUF_SIZE];
-static volatile bool reading = false;
+static bool initialized = false;
+static bool active = false;
 static volatile bool closePending = false;
-static u32 held = 0;
-static const xbox_one_device *active = NULL;
+static volatile s32 asyncError = 0;
+static volatile s32 deviceFd = -1;
+static const xbox_profile *activeProfile = NULL;
+static u8 endpointIn = 0;
+static u8 endpointOut = 0;
+static u16 reportLength = MAX_REPORT_SIZE;
+static volatile u32 heldButtons = 0;
+static volatile bool guidePressed = false;
+static int pollCountdown = 0;
 static char statusText[96] = "not found";
-static u8 sequence = 0;
 
-static const xbox_one_device *findDevice(u16 vid, u16 pid)
+/* IOS DMAs directly into this buffer. Keep it static and 32-byte aligned. */
+static u8 ATTRIBUTE_ALIGN(32) reportBuffer[MAX_REPORT_SIZE];
+
+static const xbox_profile *findProfile(u16 vid, u16 pid)
 {
-    if (vid != MS_VID)
+    if (vid != MICROSOFT_VID)
         return NULL;
 
-    for (unsigned i = 0; i < sizeof(supported) / sizeof(supported[0]); ++i)
-        if (supported[i].pid == pid)
-            return &supported[i];
-
+    for (unsigned i = 0; i < sizeof(profiles) / sizeof(profiles[0]); ++i) {
+        if (profiles[i].pid == pid)
+            return &profiles[i];
+    }
     return NULL;
 }
 
-static int16_t s16le(const u8 *p)
+static s16 readS16LE(const u8 *p)
 {
-    return (int16_t)((u16)p[0] | ((u16)p[1] << 8));
+    return (s16)((u16)p[0] | ((u16)p[1] << 8));
 }
 
-static u16 u16le(const u8 *p)
+static u16 readU16LE(const u8 *p)
 {
     return (u16)p[0] | ((u16)p[1] << 8);
 }
 
-/* libogc's IOS USB path uses IPC/DMA. Buffers passed into USB calls must live
- * in stable 32-byte aligned heap memory; aligned stack locals can still fail
- * or crash on real hardware. */
-static int sendPacket(const u8 *packet, u8 len)
+static void parseXboxOneReport(const u8 *d, u16 len)
 {
-    if (!packet || len == 0 || len > 32 || deviceId == 0)
-        return -1;
+    if (!d || len < 5)
+        return;
 
-    u8 *out = (u8 *)memalign(32, 32);
-    if (!out)
-        return -1;
-
-    memset(out, 0, 32);
-    memcpy(out, packet, len);
-    out[2] = sequence;
-
-    int rc = USB_WriteIntrMsg(deviceId, epOut, len, out);
-    free(out);
-
-    if (rc >= 0)
-        sequence++;
-    return rc;
-}
-
-static int sendPacketRetry(const u8 *packet, u8 len)
-{
-    int rc = -1;
-    for (int attempt = 0; attempt < 8; ++attempt) {
-        rc = sendPacket(packet, len);
-        if (rc >= 0)
-            return rc;
-        if (rc != USB_NAK)
-            return rc;
-        usleep(20000);
-    }
-    return rc;
-}
-
-static int initializeController(int *secondResult)
-{
-    static const u8 powerOn[] = {
-        0x05, GIP_OPT_INTERNAL, 0x00, 0x01, 0x00
-    };
-    static const u8 oneSInit[] = {
-        0x05, GIP_OPT_INTERNAL, 0x00, 0x0f, 0x06
-    };
-
-    sequence = 0;
-    int first = sendPacketRetry(powerOn, sizeof(powerOn));
-    int second = 0;
-
-    if (first >= 0 && active && active->needsSInit) {
-        usleep(20000);
-        second = sendPacketRetry(oneSInit, sizeof(oneSInit));
+    /* Xbox/Guide is delivered as a separate GIP virtual-key packet. */
+    if (d[0] == GIP_CMD_VIRTUAL_KEY) {
+        guidePressed = (d[4] & 0x01) != 0;
+        return;
     }
 
-    if (secondResult)
-        *secondResult = second;
-    return first;
+    if (d[0] != GIP_CMD_INPUT || len < 18)
+        return;
+
+    u32 buttons = 0;
+
+    /* GIP layout follows Linux xpad's xpadone_process_packet(). */
+    if (d[4] & 0x04) buttons |= PAD_BUTTON_START; /* Menu */
+    if (d[4] & 0x08) buttons |= PAD_TRIGGER_Z;    /* View */
+
+    /* Preserve Snes9x GX's Nintendo-style face-button placement. */
+    if (d[4] & 0x10) buttons |= PAD_BUTTON_B; /* Xbox A -> SNES B */
+    if (d[4] & 0x20) buttons |= PAD_BUTTON_A; /* Xbox B -> SNES A */
+    if (d[4] & 0x40) buttons |= PAD_BUTTON_Y; /* Xbox X -> SNES Y */
+    if (d[4] & 0x80) buttons |= PAD_BUTTON_X; /* Xbox Y -> SNES X */
+
+    if (d[5] & 0x01) buttons |= PAD_BUTTON_UP;
+    if (d[5] & 0x02) buttons |= PAD_BUTTON_DOWN;
+    if (d[5] & 0x04) buttons |= PAD_BUTTON_LEFT;
+    if (d[5] & 0x08) buttons |= PAD_BUTTON_RIGHT;
+    if (d[5] & 0x10) buttons |= PAD_TRIGGER_L;
+    if (d[5] & 0x20) buttons |= PAD_TRIGGER_R;
+
+    /* Xbox One triggers are 10-bit little-endian values. */
+    if ((readU16LE(&d[6]) >> 2) > TRIGGER_THRESHOLD)
+        buttons |= PAD_TRIGGER_L;
+    if ((readU16LE(&d[8]) >> 2) > TRIGGER_THRESHOLD)
+        buttons |= PAD_TRIGGER_R;
+
+    s16 lx = readS16LE(&d[10]);
+    s16 ly = (s16)~readS16LE(&d[12]);
+    s16 rx = readS16LE(&d[14]);
+    s16 ry = (s16)~readS16LE(&d[16]);
+
+    if (ly >  STICK_THRESHOLD) buttons |= PAD_BUTTON_UP;
+    if (ly < -STICK_THRESHOLD) buttons |= PAD_BUTTON_DOWN;
+    if (lx < -STICK_THRESHOLD) buttons |= PAD_BUTTON_LEFT;
+    if (lx >  STICK_THRESHOLD) buttons |= PAD_BUTTON_RIGHT;
+    if (ry >  STICK_THRESHOLD) buttons |= PAD_BUTTON_UP;
+    if (ry < -STICK_THRESHOLD) buttons |= PAD_BUTTON_DOWN;
+    if (rx < -STICK_THRESHOLD) buttons |= PAD_BUTTON_LEFT;
+    if (rx >  STICK_THRESHOLD) buttons |= PAD_BUTTON_RIGHT;
+
+    heldButtons = buttons;
 }
 
-static bool findEndpoints(usb_devdesc *desc, u8 *inEp, u8 *outEp, u16 *inSize)
+static s32 readCallback(s32 result, void *userdata)
 {
-    if (!desc || !inEp || !outEp || !inSize)
+    (void)userdata;
+
+    /* Do not log, close or reopen USB from an IOS callback. */
+    if (result < 0) {
+        asyncError = result;
+        closePending = true;
+        return 0;
+    }
+
+    if (result > 0)
+        parseXboxOneReport(reportBuffer, (u16)result);
+
+    if (deviceFd >= 0) {
+        s32 rc = USB_ReadIntrMsgAsync(deviceFd, endpointIn, reportLength,
+                                      reportBuffer, readCallback, NULL);
+        if (rc < 0) {
+            asyncError = rc;
+            closePending = true;
+        }
+    }
+    return 0;
+}
+
+static void closeController(void)
+{
+    s32 fd = deviceFd;
+    deviceFd = -1; /* callback sees invalid fd before the blocking close */
+
+    if (fd >= 0)
+        USB_CloseDevice(&fd);
+
+    active = false;
+    activeProfile = NULL;
+    endpointIn = endpointOut = 0;
+    heldButtons = 0;
+    guidePressed = false;
+    closePending = false;
+}
+
+/* Prefer the Xbox GIP interface FF/47/D0, then fall back to the first pair of
+ * interrupt endpoints exactly like the generic ioQuake3-wii implementation. */
+static bool findEndpoints(usb_devdesc *dd, u8 *inEp, u8 *outEp)
+{
+    if (!dd || !inEp || !outEp)
         return false;
 
     *inEp = 0;
     *outEp = 0;
-    *inSize = 0;
 
-    /* Prefer the Xbox GIP data interface: FF / 47 / D0. */
-    for (u8 c = 0; c < desc->bNumConfigurations; ++c) {
-        usb_configurationdesc *cfg = &desc->configurations[c];
-        for (u8 i = 0; i < cfg->bNumInterfaces; ++i) {
-            usb_interfacedesc *itf = &cfg->interfaces[i];
-            if (itf->bInterfaceClass != 0xff ||
-                itf->bInterfaceSubClass != 0x47 ||
-                itf->bInterfaceProtocol != 0xd0)
+    /* First pass: GIP data interface. */
+    for (u8 c = 0; c < dd->bNumConfigurations; ++c) {
+        usb_configurationdesc *cd = &dd->configurations[c];
+        for (u8 i = 0; i < cd->bNumInterfaces; ++i) {
+            usb_interfacedesc *id = &cd->interfaces[i];
+            if (id->bInterfaceClass != 0xff ||
+                id->bInterfaceSubClass != 0x47 ||
+                id->bInterfaceProtocol != 0xd0)
                 continue;
 
-            for (u8 e = 0; e < itf->bNumEndpoints; ++e) {
-                usb_endpointdesc *ep = &itf->endpoints[e];
+            for (u8 e = 0; e < id->bNumEndpoints; ++e) {
+                usb_endpointdesc *ep = &id->endpoints[e];
                 if ((ep->bmAttributes & 0x03) != USB_ENDPOINT_INTERRUPT)
                     continue;
-
-                if ((ep->bEndpointAddress & USB_ENDPOINT_IN) && !*inEp) {
+                if (ep->bEndpointAddress & USB_ENDPOINT_IN)
                     *inEp = ep->bEndpointAddress;
-                    *inSize = ep->wMaxPacketSize;
-                } else if (!(ep->bEndpointAddress & USB_ENDPOINT_IN) && !*outEp) {
+                else
                     *outEp = ep->bEndpointAddress;
-                }
             }
-
             if (*inEp && *outEp)
                 return true;
         }
     }
 
-    /* Fallback: first interrupt IN/OUT pair, same strategy used by the Wii
-     * USB gamepad code in ioQuake3-wii. */
-    for (u8 c = 0; c < desc->bNumConfigurations; ++c) {
-        usb_configurationdesc *cfg = &desc->configurations[c];
-        for (u8 i = 0; i < cfg->bNumInterfaces; ++i) {
-            usb_interfacedesc *itf = &cfg->interfaces[i];
-            for (u8 e = 0; e < itf->bNumEndpoints; ++e) {
-                usb_endpointdesc *ep = &itf->endpoints[e];
+    /* Fallback: first interrupt IN/OUT pair. */
+    *inEp = *outEp = 0;
+    for (u8 c = 0; c < dd->bNumConfigurations; ++c) {
+        usb_configurationdesc *cd = &dd->configurations[c];
+        for (u8 i = 0; i < cd->bNumInterfaces; ++i) {
+            usb_interfacedesc *id = &cd->interfaces[i];
+            for (u8 e = 0; e < id->bNumEndpoints; ++e) {
+                usb_endpointdesc *ep = &id->endpoints[e];
                 if ((ep->bmAttributes & 0x03) != USB_ENDPOINT_INTERRUPT)
                     continue;
-
-                if ((ep->bEndpointAddress & USB_ENDPOINT_IN) && !*inEp) {
+                if ((ep->bEndpointAddress & USB_ENDPOINT_IN) && !*inEp)
                     *inEp = ep->bEndpointAddress;
-                    *inSize = ep->wMaxPacketSize;
-                } else if (!(ep->bEndpointAddress & USB_ENDPOINT_IN) && !*outEp) {
+                else if (!(ep->bEndpointAddress & USB_ENDPOINT_IN) && !*outEp)
                     *outEp = ep->bEndpointAddress;
-                }
             }
+            if (*inEp && *outEp)
+                return true;
         }
     }
 
-    return *inEp && *outEp;
+    return *inEp != 0;
 }
 
-static void parseInput(int len)
+static s32 initializeXboxOne(s32 fd, u8 outEp)
 {
-    if (len < 5)
-        return;
+    static const u8 powerOn[] = { 0x05, 0x20, 0x00, 0x01, 0x00 };
 
-    if (inBuf[0] == GIP_CMD_VIRTUAL_KEY) {
-        snprintf(statusText, sizeof(statusText), "rx:%d cmd:07", len);
-        return;
-    }
+    if (!outEp)
+        return -1;
 
-    if (inBuf[0] != GIP_CMD_INPUT || len < 18) {
-        snprintf(statusText, sizeof(statusText), "rx:%d cmd:%02x", len, inBuf[0]);
-        return;
-    }
+    /* Proven ioQuake3-wii pattern: heap/memalign, never a stack IPC buffer. */
+    u8 *out = (u8 *)memalign(32, 32);
+    if (!out)
+        return -1;
 
-    held = 0;
-
-    held |= (inBuf[4] & 0x04) ? PAD_BUTTON_START : 0;
-    held |= (inBuf[4] & 0x08) ? PAD_TRIGGER_Z : 0;
-    held |= (inBuf[4] & 0x10) ? PAD_BUTTON_B : 0;
-    held |= (inBuf[4] & 0x20) ? PAD_BUTTON_A : 0;
-    held |= (inBuf[4] & 0x40) ? PAD_BUTTON_Y : 0;
-    held |= (inBuf[4] & 0x80) ? PAD_BUTTON_X : 0;
-
-    held |= (inBuf[5] & 0x01) ? PAD_BUTTON_UP : 0;
-    held |= (inBuf[5] & 0x02) ? PAD_BUTTON_DOWN : 0;
-    held |= (inBuf[5] & 0x04) ? PAD_BUTTON_LEFT : 0;
-    held |= (inBuf[5] & 0x08) ? PAD_BUTTON_RIGHT : 0;
-    held |= (inBuf[5] & 0x10) ? PAD_TRIGGER_L : 0;
-    held |= (inBuf[5] & 0x20) ? PAD_TRIGGER_R : 0;
-
-    if (u16le(&inBuf[6]) > TRIGGER_THRESHOLD)
-        held |= PAD_TRIGGER_L;
-    if (u16le(&inBuf[8]) > TRIGGER_THRESHOLD)
-        held |= PAD_TRIGGER_R;
-
-    int16_t lx = s16le(&inBuf[10]);
-    int16_t ly = s16le(&inBuf[12]);
-    int16_t rx = s16le(&inBuf[14]);
-    int16_t ry = s16le(&inBuf[16]);
-
-    held |= (ly > STICK_THRESHOLD) ? PAD_BUTTON_UP : 0;
-    held |= (ly < -STICK_THRESHOLD) ? PAD_BUTTON_DOWN : 0;
-    held |= (lx < -STICK_THRESHOLD) ? PAD_BUTTON_LEFT : 0;
-    held |= (lx > STICK_THRESHOLD) ? PAD_BUTTON_RIGHT : 0;
-    held |= (ry > STICK_THRESHOLD) ? PAD_BUTTON_UP : 0;
-    held |= (ry < -STICK_THRESHOLD) ? PAD_BUTTON_DOWN : 0;
-    held |= (rx < -STICK_THRESHOLD) ? PAD_BUTTON_LEFT : 0;
-    held |= (rx > STICK_THRESHOLD) ? PAD_BUTTON_RIGHT : 0;
-
-    snprintf(statusText, sizeof(statusText), "INPUT len:%d held:%08lx", len, (unsigned long)held);
+    memset(out, 0, 32);
+    memcpy(out, powerOn, sizeof(powerOn));
+    s32 rc = USB_WriteIntrMsg(fd, outEp, sizeof(powerOn), out);
+    free(out);
+    return rc;
 }
 
-static int readCallback(int result, void *userdata)
+static bool tryOpen(const usb_device_entry *entry)
 {
-    (void)userdata;
+    const xbox_profile *profile = findProfile(entry->vid, entry->pid);
+    if (!profile)
+        return false;
 
-    if (!reading || deviceId == 0)
-        return 1;
-
-    if (result <= 0) {
-        reading = false;
-        closePending = true;
-        held = 0;
-        snprintf(statusText, sizeof(statusText), "read:%d", result);
-        return 1;
+    /* IOS IPC descriptor storage must also be heap-aligned. */
+    usb_devdesc *dd = (usb_devdesc *)memalign(32, sizeof(usb_devdesc));
+    if (!dd) {
+        snprintf(statusText, sizeof(statusText), "alloc desc failed");
+        return false;
     }
+    memset(dd, 0, sizeof(*dd));
 
-    parseInput(result);
-
-    if (!reading || closePending || deviceId == 0)
-        return 1;
-
-    int rc = USB_ReadIntrMsgAsync(deviceId, epIn, packetSize, inBuf,
-                                  &readCallback, NULL);
+    s32 fd = -1;
+    s32 rc = USB_OpenDevice(entry->device_id, entry->vid, entry->pid, &fd);
     if (rc < 0) {
-        reading = false;
-        closePending = true;
-        snprintf(statusText, sizeof(statusText), "requeue:%d", rc);
+        snprintf(statusText, sizeof(statusText), "open:%d %04x:%04x",
+                 rc, entry->vid, entry->pid);
+        free(dd);
+        return false;
     }
 
-    return 1;
-}
+    rc = USB_GetDescriptors(fd, dd);
+    if (rc < 0) {
+        snprintf(statusText, sizeof(statusText), "desc:%d %04x:%04x",
+                 rc, entry->vid, entry->pid);
+        USB_CloseDevice(&fd);
+        free(dd);
+        return false;
+    }
 
-static int removalCallback(int result, void *userdata)
-{
-    (void)result;
-    (void)userdata;
+    u8 inEp = 0, outEp = 0;
+    bool endpointsOk = findEndpoints(dd, &inEp, &outEp);
+    USB_FreeDescriptors(dd);
+    free(dd);
 
-    reading = false;
-    closePending = true;
-    held = 0;
-    strcpy(statusText, "removed");
-    return 1;
-}
+    if (!endpointsOk || !inEp || !outEp) {
+        snprintf(statusText, sizeof(statusText), "no endpoints %04x:%04x",
+                 entry->vid, entry->pid);
+        USB_CloseDevice(&fd);
+        return false;
+    }
 
-static void cleanupClosedController(void)
-{
-    if (!closePending || deviceId == 0)
-        return;
+    /* Do NOT call USB_SetConfiguration/USB_SetAlternativeInterface here.
+     * IOS58 already configured the real device; ioQuake3-wii found that Xbox
+     * One and DS4 reject those calls. */
+    rc = initializeXboxOne(fd, outEp);
+    if (rc < 0) {
+        snprintf(statusText, sizeof(statusText), "init:%d ep:%02x/%02x",
+                 rc, inEp, outEp);
+        USB_CloseDevice(&fd);
+        return false;
+    }
 
-    s32 fd = deviceId;
-    reading = false;
-    deviceId = 0;
-    active = NULL;
-    held = 0;
+    deviceFd = fd;
+    activeProfile = profile;
+    endpointIn = inEp;
+    endpointOut = outEp;
+    reportLength = MAX_REPORT_SIZE;
+    heldButtons = 0;
+    guidePressed = false;
+    asyncError = 0;
     closePending = false;
-    USB_CloseDevice(&fd);
+    active = true;
+    memset(reportBuffer, 0, sizeof(reportBuffer));
+
+    rc = USB_ReadIntrMsgAsync(deviceFd, endpointIn, reportLength,
+                              reportBuffer, readCallback, NULL);
+    if (rc < 0) {
+        snprintf(statusText, sizeof(statusText), "readq:%d ep:%02x/%02x",
+                 rc, endpointIn, endpointOut);
+        closeController();
+        return false;
+    }
+
+    snprintf(statusText, sizeof(statusText), "connected %s ep:%02x/%02x",
+             profile->name, endpointIn, endpointOut);
+    return true;
 }
 
-static void openController(void)
+static bool scanVendorClass(void)
 {
-    cleanupClosedController();
-    if (deviceId != 0)
-        return;
-
-    usb_device_entry *devices = (usb_device_entry *)memalign(
+    usb_device_entry *entries = (usb_device_entry *)memalign(
         32, sizeof(usb_device_entry) * MAX_USB_DEVICES);
-    if (!devices) {
-        strcpy(statusText, "alloc devlist failed");
-        return;
+    if (!entries) {
+        snprintf(statusText, sizeof(statusText), "alloc list failed");
+        return false;
     }
-    memset(devices, 0, sizeof(usb_device_entry) * MAX_USB_DEVICES);
 
+    memset(entries, 0, sizeof(usb_device_entry) * MAX_USB_DEVICES);
     u8 count = 0;
-    s32 listResult = USB_GetDeviceList(devices, MAX_USB_DEVICES, 0, &count);
-    if (listResult < 0) {
-        count = 0;
-        listResult = USB_GetDeviceList(devices, MAX_USB_DEVICES, GIP_CLASS, &count);
-    }
-
-    if (listResult < 0) {
-        snprintf(statusText, sizeof(statusText), "list:%d", listResult);
-        free(devices);
-        return;
+    s32 rc = USB_GetDeviceList(entries, MAX_USB_DEVICES,
+                               USB_CLASS_VENDOR_SPECIFIC, &count);
+    if (rc < 0) {
+        snprintf(statusText, sizeof(statusText), "list:%d", rc);
+        free(entries);
+        return false;
     }
 
     bool sawSupported = false;
-    char lastDiag[96] = "Xbox found";
-
     for (u8 i = 0; i < count; ++i) {
-        const xbox_one_device *candidate = findDevice(devices[i].vid, devices[i].pid);
-        if (!candidate)
+        if (!findProfile(entries[i].vid, entries[i].pid))
             continue;
-
         sawSupported = true;
-
-        s32 fd = -1;
-        s32 openResult = USB_OpenDevice(devices[i].device_id,
-                                        devices[i].vid,
-                                        devices[i].pid,
-                                        &fd);
-        if (openResult < 0) {
-            snprintf(lastDiag, sizeof(lastDiag), "i%u open:%d", i, openResult);
-            continue;
+        if (tryOpen(&entries[i])) {
+            free(entries);
+            return true;
         }
-
-        /* This top-level descriptor must also be heap-backed and 32-byte
-         * aligned. A stack usb_devdesc was the source of our previous d:-4. */
-        usb_devdesc *desc = (usb_devdesc *)memalign(32, sizeof(usb_devdesc));
-        s32 descResult = -1;
-        bool endpointsFound = false;
-        u8 foundIn = 0;
-        u8 foundOut = 0;
-        u16 foundSize = 0;
-
-        if (desc) {
-            memset(desc, 0, sizeof(*desc));
-            descResult = USB_GetDescriptors(fd, desc);
-            if (descResult >= 0) {
-                endpointsFound = findEndpoints(desc, &foundIn, &foundOut, &foundSize);
-                USB_FreeDescriptors(desc);
-            }
-            free(desc);
-        }
-
-        /* Known values for 045e:02ea if descriptor parsing still fails. */
-        epIn = endpointsFound ? foundIn : 0x82;
-        epOut = endpointsFound ? foundOut : 0x02;
-        packetSize = (endpointsFound && foundSize > 0 && foundSize <= BUF_SIZE)
-                         ? foundSize
-                         : BUF_SIZE;
-
-        deviceId = fd;
-        active = candidate;
-        held = 0;
-        closePending = false;
-
-        /* Follow the existing Wii USB-gamepad implementation: initialize the
-         * pad first, then arm the interrupt IN transfer. */
-        int secondWrite = 0;
-        int firstWrite = initializeController(&secondWrite);
-
-        reading = true;
-        int queueResult = USB_ReadIntrMsgAsync(deviceId, epIn, packetSize, inBuf,
-                                               &readCallback, NULL);
-        if (queueResult < 0)
-            reading = false;
-
-        if (queueResult >= 0) {
-            USB_DeviceRemovalNotifyAsync(fd, &removalCallback, NULL);
-            snprintf(statusText, sizeof(statusText),
-                     "V10 i%u d:%d ep:%02x/%02x w:%d/%d q:%d",
-                     i, descResult, epIn, epOut,
-                     firstWrite, secondWrite, queueResult);
-            free(devices);
-            return;
-        }
-
-        snprintf(lastDiag, sizeof(lastDiag),
-                 "i%u d:%d ep:%02x/%02x w:%d/%d q:%d",
-                 i, descResult, epIn, epOut,
-                 firstWrite, secondWrite, queueResult);
-
-        deviceId = 0;
-        active = NULL;
-        reading = false;
-        USB_CloseDevice(&fd);
     }
 
-    if (sawSupported)
-        snprintf(statusText, sizeof(statusText), "%s", lastDiag);
-    else
+    if (!sawSupported)
         snprintf(statusText, sizeof(statusText), "not found (%u USB)", count);
 
-    free(devices);
+    free(entries);
+    return false;
+}
+
+static void initializeDriver(void)
+{
+    if (initialized)
+        return;
+
+    initialized = true;
+    active = false;
+    deviceFd = -1;
+    heldButtons = 0;
+    closePending = false;
+    asyncError = 0;
+
+    s32 rc = USB_Initialize();
+    if (rc < 0) {
+        snprintf(statusText, sizeof(statusText), "USB init:%d", rc);
+        return;
+    }
+
+    scanVendorClass();
+    pollCountdown = POLL_INTERVAL_FRAMES;
 }
 
 void XBOXONE_ScanPads(void)
 {
-    cleanupClosedController();
-    if (deviceId == 0)
-        openController();
+    initializeDriver();
+
+    if (closePending) {
+        s32 err = asyncError;
+        closeController();
+        snprintf(statusText, sizeof(statusText), "disconnected read:%d", err);
+        pollCountdown = 0;
+    }
+
+    if (active)
+        return;
+
+    if (--pollCountdown > 0)
+        return;
+
+    pollCountdown = POLL_INTERVAL_FRAMES;
+    scanVendorClass();
 }
 
 u32 XBOXONE_ButtonsHeld(int chan)
 {
-    cleanupClosedController();
-    if (deviceId == 0)
-        openController();
+    if (!initialized)
+        initializeDriver();
 
-    if (chan != 0 || deviceId == 0)
+    if (!active || chan != 0)
         return 0;
 
-    return held;
+    return heldButtons;
 }
 
 char *XBOXONE_Status(void)
 {
-    cleanupClosedController();
-    if (deviceId == 0)
-        openController();
-
+    if (!initialized)
+        initializeDriver();
     return statusText;
 }
 
