@@ -15,9 +15,9 @@
 
 #include <ogc/usb.h>
 #include <ogc/system.h>
+#include <ogc/timesupp.h>
 #include <stdbool.h>
 #include <string.h>
-#include <unistd.h>
 
 #define XBOX_V26_VID 0x045e
 #define XBOX_V26_PID 0x02ea
@@ -51,7 +51,7 @@ static inline void XBOX_V26_WriteProbe(s32 fd, const u8 *packet, u16 packetLen,
     s32 rc = USB_WriteIntrMsg(fd, XBOX_V26_OUT_EP, transferLen, buffer);
     if (rc >= 0)
         xboxV26Mask |= successBit;
-    usleep(15000);
+    udelay(15000);
 }
 
 static inline void XBOX_V26_RunProbe(s32 fd)
@@ -71,25 +71,22 @@ static inline void XBOX_V26_RunProbe(s32 fd)
 
     xboxV26Mask |= 0x800;
 
-    /* Baseline transfer-length and GIP-sequence matrix. */
     XBOX_V26_WriteProbe(fd, powerOn,  sizeof(powerOn),  5,  0x004, buffer);
     XBOX_V26_WriteProbe(fd, powerOn,  sizeof(powerOn),  64, 0x008, buffer);
     XBOX_V26_WriteProbe(fd, oneSSeq0, sizeof(oneSSeq0), 5,  0x010, buffer);
     XBOX_V26_WriteProbe(fd, oneSSeq1, sizeof(oneSSeq1), 5,  0x020, buffer);
     XBOX_V26_WriteProbe(fd, oneSSeq1, sizeof(oneSSeq1), 64, 0x040, buffer);
 
-    /* Endpoint-cancel/clear path, then retry the canonical packet. */
     s32 rc = USB_ClearHalt(fd, XBOX_V26_OUT_EP);
     if (rc >= 0)
         xboxV26Mask |= 0x080;
-    usleep(15000);
+    udelay(15000);
     XBOX_V26_WriteProbe(fd, powerOn, sizeof(powerOn), 5, 0x100, buffer);
 
-    /* Re-assert the known interface/alternate setting, then retry once. */
     rc = USB_SetAlternativeInterface(fd, 0, 0);
     if (rc >= 0)
         xboxV26Mask |= 0x200;
-    usleep(15000);
+    udelay(15000);
     XBOX_V26_WriteProbe(fd, powerOn, sizeof(powerOn), 5, 0x400, buffer);
 }
 
@@ -104,7 +101,6 @@ static inline s32 XBOX_V26_USB_OpenDevice(s32 device_id, u16 vid, u16 pid, s32 *
         xboxV26ProbeRan = false;
         xboxV26Mask = 0;
 
-        /* Unlike V25, failures are diagnostic only; never close the device. */
         usb_devdesc desc;
         memset(&desc, 0, sizeof(desc));
         s32 descRc = USB_GetDescriptors(*fd, &desc);
@@ -126,21 +122,16 @@ static inline s32 XBOX_V26_USB_ReadIntrMsgAsync(s32 fd, u8 endpoint, u16 length,
                                                  void *data, usbcallback cb,
                                                  void *userdata)
 {
-    /* Queue the real read first, matching Linux xpad ordering. */
     s32 rc = USB_ReadIntrMsgAsync(fd, endpoint, length, data, cb, userdata);
 
     if (fd == xboxV26Fd && endpoint == XBOX_V26_IN_EP && rc >= 0) {
         XBOX_V26_RunProbe(fd);
-        /* Preserve the real queued read but expose the whole probe mask in q:. */
         return 26000 + (s32)xboxV26Mask;
     }
 
     return rc;
 }
 
-/* Define wrappers only after their implementations so internal calls above
- * resolve to libogc2's real functions instead of recursing into this shim.
- */
 #define USB_OpenDevice       XBOX_V26_USB_OpenDevice
 #define USB_ReadIntrMsgAsync XBOX_V26_USB_ReadIntrMsgAsync
 
