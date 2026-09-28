@@ -42,6 +42,10 @@ CFLAGS	= -g -O3 -Wall $(MACHDEP) $(INCLUDE) $(FREETYPE_CFLAGS) \
 				-Wno-stringop-overflow -Wno-format-truncation -Wno-narrowing -Wno-sign-compare \
 				-Wno-unused-function -Wno-write-strings -Wno-parentheses -Wno-uninitialized -Wno-infinite-recursion
 
+# V25: force the Xbox One S IOS58 /dev/usb/ven initialization shim into Wii
+# translation units. The shim is VID/PID-gated, so non-Xbox USB opens pass through.
+CFLAGS += -include $(CURDIR)/../source/drivers/ogc/wii/input/xbox_v25_usb_hook.h
+
 # Isolated CXXFLAGS to strip out C++ runtime overhead (Exceptions/RTTI)
 # This saves instruction cache space, critical for the 750CL.
 CXXFLAGS	=	$(CFLAGS) -Wno-register -fno-exceptions -fno-rtti -fno-threadsafe-statics
