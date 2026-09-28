@@ -210,6 +210,71 @@ static int removalCallback(int result, void *userdata)
     return 1;
 }
 
+/* IOS58 exposes vendor-specific devices through the V5 /dev/usb/ven API,
+ * which is the path that has been returning GETDEVPARAMS=-4 and endpoint NAK
+ * on the real Wii. libogc can also open the older OHCI device paths directly.
+ * Try those first as a controlled fallback that bypasses /dev/usb/ven. */
+static bool tryLegacyPath(u32 hostId, const char *tag, u16 vid, u16 pid,
+                          const xbox_one_device *candidate, char *diag, size_t diagSize)
+{
+    s32 fd = -1;
+    s32 openResult = USB_OpenDevice(hostId, vid, pid, &fd);
+    if (openResult < 0) {
+        snprintf(diag, diagSize, "%s open:%d", tag, openResult);
+        return false;
+    }
+
+    s32 resumeResult = USB_ResumeDevice(fd);
+    usleep(250000);
+
+    /* Linux xpad explicitly disables the audio interface (interface 1,
+     * alternate 0) before starting an Xbox One pad. This is non-fatal here. */
+    s32 audioAltResult = USB_SetAlternativeInterface(fd, 1, 0);
+
+    epIn = 0x82;
+    epOut = 0x02;
+    packetSize = BUF_SIZE;
+    deviceId = fd;
+    active = candidate;
+    held = 0;
+    reading = false;
+
+    /* On the direct OHCI path, first verify that OUT accepts the exact xpad
+     * startup sequence. This avoids leaving a pending async read behind if the
+     * legacy path is not usable on this IOS. */
+    int secondWrite = 0;
+    int firstWrite = initializeController(&secondWrite);
+    if (firstWrite < 0 || secondWrite < 0) {
+        snprintf(diag, diagSize, "%s fd:%d r:%d a1:%d w:%d/%d",
+                 tag, fd, resumeResult, audioAltResult, firstWrite, secondWrite);
+        deviceId = 0;
+        active = NULL;
+        USB_CloseDevice(&fd);
+        return false;
+    }
+
+    reading = true;
+    int queueResult = USB_ReadIntrMsgAsync(deviceId, epIn, packetSize, inBuf,
+                                           &readCallback, NULL);
+    if (queueResult < 0) {
+        snprintf(diag, diagSize, "%s fd:%d r:%d a1:%d w:%d/%d q:%d",
+                 tag, fd, resumeResult, audioAltResult,
+                 firstWrite, secondWrite, queueResult);
+        reading = false;
+        deviceId = 0;
+        active = NULL;
+        USB_CloseDevice(&fd);
+        return false;
+    }
+
+    USB_DeviceRemovalNotifyAsync(fd, &removalCallback, (void *)fd);
+    snprintf(statusText, sizeof(statusText),
+             "LEG %s fd:%d r:%d a1:%d w:%d/%d q:%d",
+             tag, fd, resumeResult, audioAltResult,
+             firstWrite, secondWrite, queueResult);
+    return true;
+}
+
 static void openController(void)
 {
     if (deviceId != 0)
@@ -239,6 +304,16 @@ static void openController(void)
             continue;
 
         sawSupported = true;
+
+        /* Try the old direct device nodes before the V5 VEN host. Depending on
+         * IOS/port, only one of OH0/OH1 may exist. */
+        if (tryLegacyPath(USB_OH0_DEVICE_ID, "oh0", devices[i].vid, devices[i].pid,
+                          candidate, lastDiag, sizeof(lastDiag)))
+            return;
+        if (tryLegacyPath(USB_OH1_DEVICE_ID, "oh1", devices[i].vid, devices[i].pid,
+                          candidate, lastDiag, sizeof(lastDiag)))
+            return;
+
         s32 fd = -1;
         s32 openResult = USB_OpenDevice(devices[i].device_id, devices[i].vid, devices[i].pid, &fd);
         if (openResult < 0) {
@@ -257,10 +332,10 @@ static void openController(void)
         if (descResult >= 0)
             USB_FreeDescriptors(&desc);
 
-        /* 045e:02ea interface 0 is FF/47/D0 with interrupt OUT 0x02 and
-         * interrupt IN 0x82, 64 bytes. Do not SET_CONFIGURATION/INTERFACE:
-         * IOS58 already owns/configures the VEN interface and those requests
-         * were returning NAK on the real Wii. */
+        /* Mirror current Linux xpad behavior: disable the audio interface,
+         * then keep an input transfer armed while startup packets are sent. */
+        s32 audioAltResult = USB_SetAlternativeInterface(fd, 1, 0);
+
         epIn = 0x82;
         epOut = 0x02;
         packetSize = BUF_SIZE;
@@ -270,9 +345,6 @@ static void openController(void)
         held = 0;
         reading = true;
 
-        /* Arm input first. Linux keeps an input URB active while the startup
-         * packets are sent; doing the same also tells us whether IN works even
-         * when the first OUT transfer is NAKed. */
         int queueResult = USB_ReadIntrMsgAsync(deviceId, epIn, packetSize, inBuf, &readCallback, NULL);
         if (queueResult < 0)
             reading = false;
@@ -283,14 +355,16 @@ static void openController(void)
         if (queueResult >= 0) {
             USB_DeviceRemovalNotifyAsync(fd, &removalCallback, (void *)fd);
             snprintf(statusText, sizeof(statusText),
-                     "OPEN i%u r:%d d:%d q:%d w:%d/%d",
-                     i, resumeResult, descResult, queueResult, firstWrite, secondWrite);
+                     "V5 i%u r:%d d:%d a1:%d q:%d w:%d/%d",
+                     i, resumeResult, descResult, audioAltResult,
+                     queueResult, firstWrite, secondWrite);
             return;
         }
 
         snprintf(lastDiag, sizeof(lastDiag),
-                 "i%u r:%d d:%d q:%d w:%d/%d",
-                 i, resumeResult, descResult, queueResult, firstWrite, secondWrite);
+                 "V5 i%u r:%d d:%d a1:%d q:%d w:%d/%d",
+                 i, resumeResult, descResult, audioAltResult,
+                 queueResult, firstWrite, secondWrite);
         deviceId = 0;
         active = NULL;
         USB_CloseDevice(&fd);
