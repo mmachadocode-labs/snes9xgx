@@ -5,25 +5,24 @@
  *
  * USB transport/lifetime handling is adapted from Mayo1970/ioQuake3-wii's
  * code/input/wii_usb_hid.c (GPLv2). IOS IPC buffers are 32-byte aligned,
- * hotplug is polled, and the async read callback never performs filesystem
- * I/O or closes/reopens the USB device.
+ * hotplug is polled, and the async read callback never closes/reopens a USB
+ * device itself.
  *
- * Xbox One S (045e:02ea) uses a descriptor-less fast path on IOS58 because
- * USB_GetDescriptors() returns IPC_EINVAL (-4) for the V5 vendor device on
- * the test Wii. Its known GIP endpoints are interrupt IN 0x82 and OUT 0x02.
+ * Xbox One S (045e:02ea) uses a descriptor-less fast path on IOS58. On the
+ * test Wii, USB_GetDescriptors() returns IPC_EINVAL (-4) for this V5 vendor
+ * device even though USB_OpenDevice() succeeds. Its known GIP endpoints are
+ * interrupt IN 0x82 and interrupt OUT 0x02, 64-byte packets.
  *
- * Diagnostic build: early messages are buffered in RAM because the Wii input
- * driver is initialized before the filesystem/SD card is mounted. Once SD is
- * available, the main thread writes the buffered trace to xbox-usb.log.
+ * V19 intentionally avoids filesystem logging and retry loops. Diagnostics
+ * stay in RAM and are exposed through Credits so the USB path remains close
+ * to the stable V15 behavior.
  */
 
 #include <gccore.h>
 #include <ogc/usb.h>
 #include <malloc.h>
-#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
-#include <unistd.h>
 
 #define MICROSOFT_VID 0x045e
 #define XBOX_ONE_S_PID 0x02ea
@@ -37,21 +36,10 @@
 #define GIP_CMD_INPUT       0x20
 #define GIP_CMD_VIRTUAL_KEY 0x07
 
-#define DIAG_EVENT_COUNT 32
-#define DIAG_CAPTURE_BYTES 32
-#define DIAG_PENDING_BYTES 16384
-
 typedef struct {
     u16 pid;
     const char *name;
 } xbox_profile;
-
-typedef struct {
-    s32 result;
-    s32 requeue;
-    u8 length;
-    u8 data[DIAG_CAPTURE_BYTES];
-} diag_event;
 
 static const xbox_profile profiles[] = {
     { 0x02d1, "Xbox One" },
@@ -66,7 +54,7 @@ static bool initialized = false;
 static volatile bool active = false;
 static volatile bool closePending = false;
 static volatile s32 asyncError = 0;
-/* IOS58 V5 vendor device IDs are valid negative numbers. -1 is our sentinel. */
+/* IOS58 V5 vendor device IDs are valid negative numbers. -1 is only our sentinel. */
 static volatile s32 deviceFd = -1;
 static const xbox_profile *activeProfile = NULL;
 static u8 endpointIn = 0;
@@ -75,174 +63,18 @@ static u16 reportLength = MAX_REPORT_SIZE;
 static volatile u32 heldButtons = 0;
 static volatile bool guidePressed = false;
 static int pollCountdown = 0;
-static char statusText[112] = "not found";
+static char statusText[128] = "not found";
+
+/* RAM-only diagnostics. No file I/O in this driver. */
+static s32 lastDeviceId = 0;
+static s32 lastFd = -1;
+static s32 lastOpenRc = 0;
+static s32 lastResumeRc = 0;
+static s32 lastWriteRc = 0;
+static s32 lastReadQueueRc = 0;
 
 /* IOS DMAs directly into this buffer. Keep it static and 32-byte aligned. */
 static u8 ATTRIBUTE_ALIGN(32) reportBuffer[MAX_REPORT_SIZE];
-
-/* Diagnostic file is used only by the main thread. */
-static FILE *diagFile = NULL;
-static u32 diagSequence = 0;
-static u32 diagPositiveReadsLogged = 0;
-static char diagPending[DIAG_PENDING_BYTES];
-static size_t diagPendingLen = 0;
-static u32 diagPendingDropped = 0;
-static char diagOpenedPath[64] = "RAM only";
-
-/* Callback -> main-thread ring buffer. No file I/O from the IOS callback. */
-static diag_event diagEvents[DIAG_EVENT_COUNT];
-static volatile u32 diagEventWrite = 0;
-static volatile u32 diagEventRead = 0;
-static volatile u32 diagEventsDropped = 0;
-
-static void diagQueueBytes(const char *data, size_t len)
-{
-    if (!data || !len)
-        return;
-
-    if (len > sizeof(diagPending) - diagPendingLen) {
-        size_t room = sizeof(diagPending) - diagPendingLen;
-        if (room) {
-            memcpy(diagPending + diagPendingLen, data, room);
-            diagPendingLen += room;
-        }
-        diagPendingDropped++;
-        return;
-    }
-
-    memcpy(diagPending + diagPendingLen, data, len);
-    diagPendingLen += len;
-}
-
-/*
- * The input driver comes up before WiiFileSystemDriver::init(), so fopen()
- * commonly fails during the first Xbox scan. Do not latch that failure.
- * Retry from the normal main-thread polling path until SD becomes available.
- */
-static bool diagTryOpen(void)
-{
-    if (diagFile)
-        return true;
-
-    const char *paths[] = {
-        "sd:/snes9xgx/xbox-usb.log",
-        "sd:/xbox-usb.log",
-        "usb:/snes9xgx/xbox-usb.log",
-        "usb:/xbox-usb.log"
-    };
-
-    for (unsigned i = 0; i < sizeof(paths) / sizeof(paths[0]); ++i) {
-        FILE *f = fopen(paths[i], "w");
-        if (!f)
-            continue;
-
-        /* Diagnostic build: unbuffered writes make every completed line durable. */
-        setvbuf(f, NULL, _IONBF, 0);
-
-        if (diagPendingLen) {
-            size_t n = fwrite(diagPending, 1, diagPendingLen, f);
-            if (n != diagPendingLen) {
-                fclose(f);
-                continue;
-            }
-        }
-
-        diagFile = f;
-        strncpy(diagOpenedPath, paths[i], sizeof(diagOpenedPath) - 1);
-        diagOpenedPath[sizeof(diagOpenedPath) - 1] = 0;
-        diagPendingLen = 0;
-
-        fprintf(diagFile, "[diag] file opened: %s\n", diagOpenedPath);
-        if (diagPendingDropped)
-            fprintf(diagFile, "[diag] RAM log overflow before mount: dropped=%u\n",
-                    (unsigned)diagPendingDropped);
-        return true;
-    }
-
-    return false;
-}
-
-static void diagLog(const char *fmt, ...)
-{
-    char line[512];
-    int prefix = snprintf(line, sizeof(line), "[%06u] ", (unsigned)diagSequence++);
-    if (prefix < 0)
-        return;
-    if ((size_t)prefix >= sizeof(line))
-        prefix = sizeof(line) - 1;
-
-    va_list ap;
-    va_start(ap, fmt);
-    int body = vsnprintf(line + prefix, sizeof(line) - (size_t)prefix, fmt, ap);
-    va_end(ap);
-
-    size_t len;
-    if (body < 0)
-        len = (size_t)prefix;
-    else {
-        size_t wanted = (size_t)prefix + (size_t)body;
-        len = wanted < sizeof(line) ? wanted : sizeof(line) - 1;
-    }
-
-    if (len + 1 < sizeof(line))
-        line[len++] = '\n';
-    else {
-        line[sizeof(line) - 2] = '\n';
-        len = sizeof(line) - 1;
-    }
-
-    if (diagTryOpen()) {
-        size_t n = fwrite(line, 1, len, diagFile);
-        if (n == len)
-            return;
-
-        /* Storage disappeared or write failed. Preserve future lines in RAM. */
-        fclose(diagFile);
-        diagFile = NULL;
-        strncpy(diagOpenedPath, "RAM after write failure", sizeof(diagOpenedPath) - 1);
-        diagOpenedPath[sizeof(diagOpenedPath) - 1] = 0;
-    }
-
-    diagQueueBytes(line, len);
-}
-
-static void drainDiagEvents(void)
-{
-    u32 dropped = diagEventsDropped;
-    if (dropped) {
-        diagEventsDropped = 0;
-        diagLog("CALLBACK queue overflow: dropped=%u", (unsigned)dropped);
-    }
-
-    while (diagEventRead != diagEventWrite) {
-        u32 r = diagEventRead;
-        diag_event ev = diagEvents[r % DIAG_EVENT_COUNT];
-        diagEventRead = r + 1;
-
-        if (ev.result > 0 && diagPositiveReadsLogged >= 64)
-            continue;
-
-        if (ev.result > 0)
-            diagPositiveReadsLogged++;
-
-        char hex[(DIAG_CAPTURE_BYTES * 3) + 1];
-        hex[0] = 0;
-        size_t pos = 0;
-        for (u8 i = 0; i < ev.length && pos + 4 < sizeof(hex); ++i) {
-            int n = snprintf(hex + pos, sizeof(hex) - pos, "%02x%s",
-                             ev.data[i], (i + 1 < ev.length) ? " " : "");
-            if (n < 0)
-                break;
-            pos += (size_t)n;
-        }
-
-        if (ev.result > 0)
-            diagLog("READ callback result=%d requeue=%d bytes[%u]=%s",
-                    ev.result, ev.requeue, ev.length, hex);
-        else
-            diagLog("READ callback result=%d requeue=%d", ev.result, ev.requeue);
-    }
-}
 
 static const xbox_profile *findProfile(u16 vid, u16 pid)
 {
@@ -271,6 +103,7 @@ static void parseXboxOneReport(const u8 *d, u16 len)
     if (!d || len < 5)
         return;
 
+    /* Xbox/Guide is delivered as a separate GIP virtual-key packet. */
     if (d[0] == GIP_CMD_VIRTUAL_KEY) {
         guidePressed = (d[4] & 0x01) != 0;
         return;
@@ -323,49 +156,23 @@ static s32 readCallback(s32 result, void *userdata)
 {
     (void)userdata;
 
-    u32 w = diagEventWrite;
-    diag_event *ev = NULL;
-    if ((w - diagEventRead) < DIAG_EVENT_COUNT) {
-        ev = &diagEvents[w % DIAG_EVENT_COUNT];
-        ev->result = result;
-        ev->requeue = 0;
-        ev->length = 0;
-
-        if (result > 0) {
-            u32 copyLen = (u32)result;
-            if (copyLen > DIAG_CAPTURE_BYTES)
-                copyLen = DIAG_CAPTURE_BYTES;
-            ev->length = (u8)copyLen;
-            memcpy(ev->data, reportBuffer, copyLen);
-        }
-    } else {
-        diagEventsDropped++;
-    }
-
     if (result < 0) {
         asyncError = result;
         closePending = true;
-        if (ev)
-            diagEventWrite = w + 1;
         return 0;
     }
 
     if (result > 0)
         parseXboxOneReport(reportBuffer, (u16)result);
 
-    s32 requeue = 0;
+    /* V5 vendor IDs are negative, so never test deviceFd >= 0 here. */
     if (active && deviceFd != -1) {
-        requeue = USB_ReadIntrMsgAsync(deviceFd, endpointIn, reportLength,
-                                       reportBuffer, readCallback, NULL);
-        if (requeue < 0) {
-            asyncError = requeue;
+        s32 rc = USB_ReadIntrMsgAsync(deviceFd, endpointIn, reportLength,
+                                      reportBuffer, readCallback, NULL);
+        if (rc < 0) {
+            asyncError = rc;
             closePending = true;
         }
-    }
-
-    if (ev) {
-        ev->requeue = requeue;
-        diagEventWrite = w + 1;
     }
     return 0;
 }
@@ -376,11 +183,8 @@ static void closeController(void)
     active = false;
     deviceFd = -1;
 
-    if (fd != -1) {
-        s32 tmp = fd;
-        s32 rc = USB_CloseDevice(&tmp);
-        diagLog("USB_CloseDevice fd=%d -> %d", fd, rc);
-    }
+    if (fd != -1)
+        USB_CloseDevice(&fd);
 
     activeProfile = NULL;
     endpointIn = endpointOut = 0;
@@ -389,7 +193,8 @@ static void closeController(void)
     closePending = false;
 }
 
-/* Prefer the Xbox GIP FF/47/D0 interface, then first interrupt IN/OUT pair. */
+/* Prefer the Xbox GIP interface FF/47/D0, then fall back to the first pair of
+ * interrupt endpoints exactly like the generic ioQuake3-wii implementation. */
 static bool findEndpoints(usb_devdesc *dd, u8 *inEp, u8 *outEp)
 {
     if (!dd || !inEp || !outEp)
@@ -443,9 +248,11 @@ static bool findEndpoints(usb_devdesc *dd, u8 *inEp, u8 *outEp)
     return *inEp != 0;
 }
 
-static s32 writePacketAligned(s32 fd, u8 outEp, const u8 *data, u8 len)
+static s32 initializeXboxOne(s32 fd, u8 outEp)
 {
-    if (!outEp || !data || !len || len > 32)
+    static const u8 powerOn[] = { 0x05, 0x20, 0x00, 0x01, 0x00 };
+
+    if (!outEp)
         return -1;
 
     u8 *out = (u8 *)memalign(32, 32);
@@ -453,24 +260,9 @@ static s32 writePacketAligned(s32 fd, u8 outEp, const u8 *data, u8 len)
         return -1;
 
     memset(out, 0, 32);
-    memcpy(out, data, len);
-    s32 rc = USB_WriteIntrMsg(fd, outEp, len, out);
+    memcpy(out, powerOn, sizeof(powerOn));
+    s32 rc = USB_WriteIntrMsg(fd, outEp, sizeof(powerOn), out);
     free(out);
-    return rc;
-}
-
-static s32 retryWritePacket(s32 fd, u8 outEp, const char *label,
-                            const u8 *data, u8 len, int attempts)
-{
-    s32 rc = -1;
-    for (int i = 0; i < attempts; ++i) {
-        rc = writePacketAligned(fd, outEp, data, len);
-        diagLog("WRITE %s attempt=%d ep=%02x len=%u -> %d",
-                label, i + 1, outEp, len, rc);
-        if (rc >= 0)
-            break;
-        usleep(25000);
-    }
     return rc;
 }
 
@@ -480,16 +272,16 @@ static bool tryOpen(const usb_device_entry *entry)
     if (!profile)
         return false;
 
-    diagLog("TRY device_id=%d vid=%04x pid=%04x name=%s",
-            entry->device_id, entry->vid, entry->pid, profile->name);
+    lastDeviceId = entry->device_id;
 
     s32 fd = -1;
     s32 rc = USB_OpenDevice(entry->device_id, entry->vid, entry->pid, &fd);
-    diagLog("USB_OpenDevice device_id=%d -> rc=%d fd=%d",
-            entry->device_id, rc, fd);
+    lastOpenRc = rc;
+    lastFd = fd;
     if (rc < 0) {
-        snprintf(statusText, sizeof(statusText), "open:%d %04x:%04x",
-                 rc, entry->vid, entry->pid);
+        snprintf(statusText, sizeof(statusText),
+                 "open:%d id:%d %04x:%04x", rc, entry->device_id,
+                 entry->vid, entry->pid);
         return false;
     }
 
@@ -500,19 +292,16 @@ static bool tryOpen(const usb_device_entry *entry)
     if (directPath) {
         inEp = 0x82;
         outEp = 0x02;
-        diagLog("endpoint mode=direct IN=%02x OUT=%02x packet=%u",
-                inEp, outEp, MAX_REPORT_SIZE);
     } else {
         usb_devdesc *dd = (usb_devdesc *)memalign(32, sizeof(usb_devdesc));
         if (!dd) {
-            diagLog("descriptor alloc failed");
+            snprintf(statusText, sizeof(statusText), "alloc desc failed");
             USB_CloseDevice(&fd);
             return false;
         }
         memset(dd, 0, sizeof(*dd));
 
         rc = USB_GetDescriptors(fd, dd);
-        diagLog("USB_GetDescriptors fd=%d -> %d", fd, rc);
         if (rc < 0) {
             snprintf(statusText, sizeof(statusText), "desc:%d %04x:%04x",
                      rc, entry->vid, entry->pid);
@@ -522,8 +311,6 @@ static bool tryOpen(const usb_device_entry *entry)
         }
 
         bool endpointsOk = findEndpoints(dd, &inEp, &outEp);
-        diagLog("descriptor endpoints ok=%d IN=%02x OUT=%02x",
-                endpointsOk ? 1 : 0, inEp, outEp);
         USB_FreeDescriptors(dd);
         free(dd);
 
@@ -535,14 +322,20 @@ static bool tryOpen(const usb_device_entry *entry)
         }
     }
 
-    s32 resumeRc = USB_ResumeDevice(fd);
-    diagLog("USB_ResumeDevice fd=%d -> %d", fd, resumeRc);
-    usleep(150000);
+    /* Single resume probe; unlike V16-V18 there are no halt clears, retries,
+     * filesystem writes or reordered platform initialization. */
+    lastResumeRc = USB_ResumeDevice(fd);
 
-    s32 clearInRc = USB_ClearHalt(fd, inEp);
-    s32 clearOutRc = USB_ClearHalt(fd, outEp);
-    diagLog("USB_ClearHalt IN=%02x -> %d; OUT=%02x -> %d",
-            inEp, clearInRc, outEp, clearOutRc);
+    rc = initializeXboxOne(fd, outEp);
+    lastWriteRc = rc;
+    if (rc < 0) {
+        snprintf(statusText, sizeof(statusText),
+                 "%s fd:%d r:%d w:%d ep:%02x/%02x",
+                 directPath ? "direct" : "desc", fd,
+                 lastResumeRc, lastWriteRc, inEp, outEp);
+        USB_CloseDevice(&fd);
+        return false;
+    }
 
     deviceFd = fd;
     activeProfile = profile;
@@ -556,33 +349,23 @@ static bool tryOpen(const usb_device_entry *entry)
     active = true;
     memset(reportBuffer, 0, sizeof(reportBuffer));
 
-    s32 readQueueRc = USB_ReadIntrMsgAsync(deviceFd, endpointIn, reportLength,
-                                           reportBuffer, readCallback, NULL);
-    diagLog("USB_ReadIntrMsgAsync fd=%d ep=%02x len=%u -> %d",
-            fd, endpointIn, reportLength, readQueueRc);
-    if (readQueueRc < 0) {
-        snprintf(statusText, sizeof(statusText), "direct readq:%d ep:%02x/%02x",
-                 readQueueRc, endpointIn, endpointOut);
+    rc = USB_ReadIntrMsgAsync(deviceFd, endpointIn, reportLength,
+                              reportBuffer, readCallback, NULL);
+    lastReadQueueRc = rc;
+    if (rc < 0) {
+        snprintf(statusText, sizeof(statusText),
+                 "%s fd:%d r:%d w:%d q:%d ep:%02x/%02x",
+                 directPath ? "direct" : "desc", fd,
+                 lastResumeRc, lastWriteRc, lastReadQueueRc,
+                 endpointIn, endpointOut);
         closeController();
         return false;
     }
 
-    static const u8 powerOn[] = { 0x05, 0x20, 0x00, 0x01, 0x00 };
-    static const u8 oneSInit[] = { 0x05, 0x20, 0x00, 0x0f, 0x06 };
-
-    s32 powerRc = retryWritePacket(fd, outEp, "power-on",
-                                   powerOn, sizeof(powerOn), 12);
-    s32 oneSRc = 0;
-    if (entry->pid == XBOX_ONE_S_PID)
-        oneSRc = retryWritePacket(fd, outEp, "one-s-init",
-                                  oneSInit, sizeof(oneSInit), 6);
-
-    diagLog("OPEN COMPLETE fd=%d resume=%d clear=%d/%d readq=%d power=%d oneS=%d",
-            fd, resumeRc, clearInRc, clearOutRc, readQueueRc, powerRc, oneSRc);
-
     snprintf(statusText, sizeof(statusText),
-             "connected diag r:%d q:%d w:%d/%d ep:%02x/%02x",
-             resumeRc, readQueueRc, powerRc, oneSRc, endpointIn, endpointOut);
+             "connected fd:%d r:%d w:%d q:%d ep:%02x/%02x",
+             fd, lastResumeRc, lastWriteRc, lastReadQueueRc,
+             endpointIn, endpointOut);
     return true;
 }
 
@@ -592,7 +375,6 @@ static bool scanVendorClass(void)
         32, sizeof(usb_device_entry) * MAX_USB_DEVICES);
     if (!entries) {
         snprintf(statusText, sizeof(statusText), "alloc list failed");
-        diagLog("USB device list alloc failed");
         return false;
     }
 
@@ -600,7 +382,6 @@ static bool scanVendorClass(void)
     u8 count = 0;
     s32 rc = USB_GetDeviceList(entries, MAX_USB_DEVICES,
                                USB_CLASS_VENDOR_SPECIFIC, &count);
-    diagLog("USB_GetDeviceList class=ff -> rc=%d count=%u", rc, count);
     if (rc < 0) {
         snprintf(statusText, sizeof(statusText), "list:%d", rc);
         free(entries);
@@ -609,12 +390,8 @@ static bool scanVendorClass(void)
 
     bool sawSupported = false;
     for (u8 i = 0; i < count; ++i) {
-        diagLog("LIST[%u] device_id=%d vid=%04x pid=%04x",
-                i, entries[i].device_id, entries[i].vid, entries[i].pid);
-
         if (!findProfile(entries[i].vid, entries[i].pid))
             continue;
-
         sawSupported = true;
         if (tryOpen(&entries[i])) {
             free(entries);
@@ -634,22 +411,21 @@ static void initializeDriver(void)
     if (initialized)
         return;
 
-    /* These lines will stay in RAM until the SD filesystem is mounted. */
-    diagLog("===== Xbox USB diagnostic session (IOS %u) =====",
-            (unsigned)IOS_GetVersion());
-    diagLog("driver init begin");
-
     initialized = true;
     active = false;
     deviceFd = -1;
     heldButtons = 0;
     closePending = false;
     asyncError = 0;
-    diagEventRead = diagEventWrite = 0;
-    diagEventsDropped = 0;
+
+    lastDeviceId = 0;
+    lastFd = -1;
+    lastOpenRc = 0;
+    lastResumeRc = 0;
+    lastWriteRc = 0;
+    lastReadQueueRc = 0;
 
     s32 rc = USB_Initialize();
-    diagLog("USB_Initialize -> %d", rc);
     if (rc < 0) {
         snprintf(statusText, sizeof(statusText), "USB init:%d", rc);
         return;
@@ -663,16 +439,12 @@ void XBOXONE_ScanPads(void)
 {
     initializeDriver();
 
-    /* Filesystem initialization happens after input initialization. Keep
-     * retrying here from the normal main thread until SD becomes writable. */
-    diagTryOpen();
-    drainDiagEvents();
-
     if (closePending) {
         s32 err = asyncError;
-        diagLog("closePending asyncError=%d", err);
         closeController();
-        snprintf(statusText, sizeof(statusText), "disconnected read:%d", err);
+        snprintf(statusText, sizeof(statusText),
+                 "readcb:%d fd:%d r:%d w:%d q:%d",
+                 err, lastFd, lastResumeRc, lastWriteRc, lastReadQueueRc);
         pollCountdown = 0;
     }
 
@@ -683,7 +455,6 @@ void XBOXONE_ScanPads(void)
         return;
 
     pollCountdown = POLL_INTERVAL_FRAMES;
-    diagLog("poll rescan");
     scanVendorClass();
 }
 
@@ -702,15 +473,6 @@ char *XBOXONE_Status(void)
 {
     if (!initialized)
         initializeDriver();
-    diagTryOpen();
-    drainDiagEvents();
-
-    /* If the SD still is not mounted, make that visible in Credits. */
-    if (!diagFile && strstr(statusText, "diag") == NULL) {
-        static char statusWithLog[112];
-        snprintf(statusWithLog, sizeof(statusWithLog), "%s log:RAM", statusText);
-        return statusWithLog;
-    }
     return statusText;
 }
 
