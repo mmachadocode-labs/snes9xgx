@@ -5,20 +5,25 @@
  *
  * USB transport/lifetime handling is adapted from Mayo1970/ioQuake3-wii's
  * code/input/wii_usb_hid.c (GPLv2). IOS IPC buffers are 32-byte aligned,
- * hotplug is polled, and the async read callback never closes/reopens a USB
- * device itself.
+ * hotplug is polled, and the async read callback never performs filesystem
+ * I/O or closes/reopens the USB device.
  *
- * Xbox One S (045e:02ea) uses a descriptor-less fast path on IOS58. On the
- * test Wii, USB_GetDescriptors() returns IPC_EINVAL (-4) for this V5 vendor
- * device even though USB_OpenDevice() succeeds. Its known GIP endpoints are
- * interrupt IN 0x82 and interrupt OUT 0x02, 64-byte packets.
+ * Xbox One S (045e:02ea) uses a descriptor-less fast path on IOS58 because
+ * USB_GetDescriptors() returns IPC_EINVAL (-4) for the V5 vendor device on
+ * the test Wii. Its known GIP endpoints are interrupt IN 0x82 and OUT 0x02.
+ *
+ * Diagnostic build: the main thread appends a detailed trace to
+ * sd:/snes9xgx/xbox-usb.log (with fallbacks). IOS callbacks only enqueue
+ * small in-memory events; the main thread drains them later.
  */
 
 #include <gccore.h>
 #include <ogc/usb.h>
 #include <malloc.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 #define MICROSOFT_VID 0x045e
 #define XBOX_ONE_S_PID 0x02ea
@@ -32,10 +37,20 @@
 #define GIP_CMD_INPUT       0x20
 #define GIP_CMD_VIRTUAL_KEY 0x07
 
+#define DIAG_EVENT_COUNT 32
+#define DIAG_CAPTURE_BYTES 32
+
 typedef struct {
     u16 pid;
     const char *name;
 } xbox_profile;
+
+typedef struct {
+    s32 result;
+    s32 requeue;
+    u8 length;
+    u8 data[DIAG_CAPTURE_BYTES];
+} diag_event;
 
 static const xbox_profile profiles[] = {
     { 0x02d1, "Xbox One" },
@@ -50,7 +65,7 @@ static bool initialized = false;
 static volatile bool active = false;
 static volatile bool closePending = false;
 static volatile s32 asyncError = 0;
-/* IOS58 V5 vendor device IDs are valid negative numbers. -1 is only our sentinel. */
+/* IOS58 V5 vendor device IDs are valid negative numbers. -1 is our sentinel. */
 static volatile s32 deviceFd = -1;
 static const xbox_profile *activeProfile = NULL;
 static u8 endpointIn = 0;
@@ -63,6 +78,98 @@ static char statusText[96] = "not found";
 
 /* IOS DMAs directly into this buffer. Keep it static and 32-byte aligned. */
 static u8 ATTRIBUTE_ALIGN(32) reportBuffer[MAX_REPORT_SIZE];
+
+/* Diagnostic file is used only by the main thread. */
+static FILE *diagFile = NULL;
+static bool diagFileTried = false;
+static u32 diagSequence = 0;
+static u32 diagPositiveReadsLogged = 0;
+
+/* Callback -> main-thread ring buffer. No file I/O from the IOS callback. */
+static diag_event diagEvents[DIAG_EVENT_COUNT];
+static volatile u32 diagEventWrite = 0;
+static volatile u32 diagEventRead = 0;
+static volatile u32 diagEventsDropped = 0;
+
+static void diagOpen(void)
+{
+    if (diagFile || diagFileTried)
+        return;
+
+    diagFileTried = true;
+    const char *paths[] = {
+        "sd:/snes9xgx/xbox-usb.log",
+        "sd:/xbox-usb.log",
+        "usb:/snes9xgx/xbox-usb.log",
+        "usb:/xbox-usb.log"
+    };
+
+    for (unsigned i = 0; i < sizeof(paths) / sizeof(paths[0]); ++i) {
+        diagFile = fopen(paths[i], "a");
+        if (diagFile) {
+            setvbuf(diagFile, NULL, _IOLBF, 0);
+            fprintf(diagFile, "\n===== Xbox USB diagnostic session (IOS %u) =====\n",
+                    (unsigned)IOS_GetVersion());
+            fflush(diagFile);
+            break;
+        }
+    }
+}
+
+static void diagLog(const char *fmt, ...)
+{
+    diagOpen();
+    if (!diagFile)
+        return;
+
+    fprintf(diagFile, "[%06u] ", (unsigned)diagSequence++);
+
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(diagFile, fmt, ap);
+    va_end(ap);
+
+    fputc('\n', diagFile);
+    fflush(diagFile);
+}
+
+static void drainDiagEvents(void)
+{
+    u32 dropped = diagEventsDropped;
+    if (dropped) {
+        diagEventsDropped = 0;
+        diagLog("CALLBACK queue overflow: dropped=%u", (unsigned)dropped);
+    }
+
+    while (diagEventRead != diagEventWrite) {
+        u32 r = diagEventRead;
+        diag_event ev = diagEvents[r % DIAG_EVENT_COUNT];
+        diagEventRead = r + 1;
+
+        if (ev.result > 0 && diagPositiveReadsLogged >= 64)
+            continue;
+
+        if (ev.result > 0)
+            diagPositiveReadsLogged++;
+
+        char hex[(DIAG_CAPTURE_BYTES * 3) + 1];
+        hex[0] = 0;
+        size_t pos = 0;
+        for (u8 i = 0; i < ev.length && pos + 4 < sizeof(hex); ++i) {
+            int n = snprintf(hex + pos, sizeof(hex) - pos, "%02x%s",
+                             ev.data[i], (i + 1 < ev.length) ? " " : "");
+            if (n < 0)
+                break;
+            pos += (size_t)n;
+        }
+
+        if (ev.result > 0)
+            diagLog("READ callback result=%d requeue=%d bytes[%u]=%s",
+                    ev.result, ev.requeue, ev.length, hex);
+        else
+            diagLog("READ callback result=%d requeue=%d", ev.result, ev.requeue);
+    }
+}
 
 static const xbox_profile *findProfile(u16 vid, u16 pid)
 {
@@ -91,7 +198,6 @@ static void parseXboxOneReport(const u8 *d, u16 len)
     if (!d || len < 5)
         return;
 
-    /* Xbox/Guide is delivered as a separate GIP virtual-key packet. */
     if (d[0] == GIP_CMD_VIRTUAL_KEY) {
         guidePressed = (d[4] & 0x01) != 0;
         return;
@@ -102,9 +208,8 @@ static void parseXboxOneReport(const u8 *d, u16 len)
 
     u32 buttons = 0;
 
-    /* GIP layout follows Linux xpad's xpadone_process_packet(). */
-    if (d[4] & 0x04) buttons |= PAD_BUTTON_START; /* Menu */
-    if (d[4] & 0x08) buttons |= PAD_TRIGGER_Z;    /* View */
+    if (d[4] & 0x04) buttons |= PAD_BUTTON_START;
+    if (d[4] & 0x08) buttons |= PAD_TRIGGER_Z;
 
     /* Preserve Snes9x GX's Nintendo-style face-button placement. */
     if (d[4] & 0x10) buttons |= PAD_BUTTON_B; /* Xbox A -> SNES B */
@@ -119,7 +224,6 @@ static void parseXboxOneReport(const u8 *d, u16 len)
     if (d[5] & 0x10) buttons |= PAD_TRIGGER_L;
     if (d[5] & 0x20) buttons |= PAD_TRIGGER_R;
 
-    /* Xbox One triggers are 10-bit little-endian values. */
     if ((readU16LE(&d[6]) >> 2) > TRIGGER_THRESHOLD)
         buttons |= PAD_TRIGGER_L;
     if ((readU16LE(&d[8]) >> 2) > TRIGGER_THRESHOLD)
@@ -146,24 +250,49 @@ static s32 readCallback(s32 result, void *userdata)
 {
     (void)userdata;
 
-    /* Do not log, close or reopen USB from an IOS callback. */
+    u32 w = diagEventWrite;
+    diag_event *ev = NULL;
+    if ((w - diagEventRead) < DIAG_EVENT_COUNT) {
+        ev = &diagEvents[w % DIAG_EVENT_COUNT];
+        ev->result = result;
+        ev->requeue = 0;
+        ev->length = 0;
+
+        if (result > 0) {
+            u32 copyLen = (u32)result;
+            if (copyLen > DIAG_CAPTURE_BYTES)
+                copyLen = DIAG_CAPTURE_BYTES;
+            ev->length = (u8)copyLen;
+            memcpy(ev->data, reportBuffer, copyLen);
+        }
+    } else {
+        diagEventsDropped++;
+    }
+
     if (result < 0) {
         asyncError = result;
         closePending = true;
+        if (ev)
+            diagEventWrite = w + 1;
         return 0;
     }
 
     if (result > 0)
         parseXboxOneReport(reportBuffer, (u16)result);
 
-    /* V5 vendor IDs are negative, so never test deviceFd >= 0 here. */
+    s32 requeue = 0;
     if (active && deviceFd != -1) {
-        s32 rc = USB_ReadIntrMsgAsync(deviceFd, endpointIn, reportLength,
-                                      reportBuffer, readCallback, NULL);
-        if (rc < 0) {
-            asyncError = rc;
+        requeue = USB_ReadIntrMsgAsync(deviceFd, endpointIn, reportLength,
+                                       reportBuffer, readCallback, NULL);
+        if (requeue < 0) {
+            asyncError = requeue;
             closePending = true;
         }
+    }
+
+    if (ev) {
+        ev->requeue = requeue;
+        diagEventWrite = w + 1;
     }
     return 0;
 }
@@ -172,11 +301,13 @@ static void closeController(void)
 {
     s32 fd = deviceFd;
     active = false;
-    deviceFd = -1; /* callback sees invalid fd before the blocking close */
+    deviceFd = -1;
 
-    /* Negative IOS58 V5 vendor IDs are valid handles. */
-    if (fd != -1)
-        USB_CloseDevice(&fd);
+    if (fd != -1) {
+        s32 tmp = fd;
+        s32 rc = USB_CloseDevice(&tmp);
+        diagLog("USB_CloseDevice fd=%d -> %d", fd, rc);
+    }
 
     activeProfile = NULL;
     endpointIn = endpointOut = 0;
@@ -185,8 +316,6 @@ static void closeController(void)
     closePending = false;
 }
 
-/* Prefer the Xbox GIP interface FF/47/D0, then fall back to the first pair of
- * interrupt endpoints exactly like the generic ioQuake3-wii implementation. */
 static bool findEndpoints(usb_devdesc *dd, u8 *inEp, u8 *outEp)
 {
     if (!dd || !inEp || !outEp)
@@ -195,7 +324,6 @@ static bool findEndpoints(usb_devdesc *dd, u8 *inEp, u8 *outEp)
     *inEp = 0;
     *outEp = 0;
 
-    /* First pass: GIP data interface. */
     for (u8 c = 0; c < dd->bNumConfigurations; ++c) {
         usb_configurationdesc *cd = &dd->configurations[c];
         for (u8 i = 0; i < cd->bNumInterfaces; ++i) {
@@ -219,7 +347,6 @@ static bool findEndpoints(usb_devdesc *dd, u8 *inEp, u8 *outEp)
         }
     }
 
-    /* Fallback: first interrupt IN/OUT pair. */
     *inEp = *outEp = 0;
     for (u8 c = 0; c < dd->bNumConfigurations; ++c) {
         usb_configurationdesc *cd = &dd->configurations[c];
@@ -242,22 +369,34 @@ static bool findEndpoints(usb_devdesc *dd, u8 *inEp, u8 *outEp)
     return *inEp != 0;
 }
 
-static s32 initializeXboxOne(s32 fd, u8 outEp)
+static s32 writePacketAligned(s32 fd, u8 outEp, const u8 *data, u8 len)
 {
-    static const u8 powerOn[] = { 0x05, 0x20, 0x00, 0x01, 0x00 };
-
-    if (!outEp)
+    if (!outEp || !data || !len || len > 32)
         return -1;
 
-    /* Proven ioQuake3-wii pattern: heap/memalign, never a stack IPC buffer. */
     u8 *out = (u8 *)memalign(32, 32);
     if (!out)
         return -1;
 
     memset(out, 0, 32);
-    memcpy(out, powerOn, sizeof(powerOn));
-    s32 rc = USB_WriteIntrMsg(fd, outEp, sizeof(powerOn), out);
+    memcpy(out, data, len);
+    s32 rc = USB_WriteIntrMsg(fd, outEp, len, out);
     free(out);
+    return rc;
+}
+
+static s32 retryWritePacket(s32 fd, u8 outEp, const char *label,
+                            const u8 *data, u8 len, int attempts)
+{
+    s32 rc = -1;
+    for (int i = 0; i < attempts; ++i) {
+        rc = writePacketAligned(fd, outEp, data, len);
+        diagLog("WRITE %s attempt=%d ep=%02x len=%u -> %d",
+                label, i + 1, outEp, len, rc);
+        if (rc >= 0)
+            break;
+        usleep(25000);
+    }
     return rc;
 }
 
@@ -267,8 +406,13 @@ static bool tryOpen(const usb_device_entry *entry)
     if (!profile)
         return false;
 
+    diagLog("TRY device_id=%d vid=%04x pid=%04x name=%s",
+            entry->device_id, entry->vid, entry->pid, profile->name);
+
     s32 fd = -1;
     s32 rc = USB_OpenDevice(entry->device_id, entry->vid, entry->pid, &fd);
+    diagLog("USB_OpenDevice device_id=%d -> rc=%d fd=%d",
+            entry->device_id, rc, fd);
     if (rc < 0) {
         snprintf(statusText, sizeof(statusText), "open:%d %04x:%04x",
                  rc, entry->vid, entry->pid);
@@ -280,21 +424,21 @@ static bool tryOpen(const usb_device_entry *entry)
     bool directPath = entry->vid == MICROSOFT_VID && entry->pid == XBOX_ONE_S_PID;
 
     if (directPath) {
-        /* Known descriptor for 045e:02ea: interface 0 GIP data endpoints. */
         inEp = 0x82;
         outEp = 0x02;
+        diagLog("endpoint mode=direct IN=%02x OUT=%02x packet=%u",
+                inEp, outEp, MAX_REPORT_SIZE);
     } else {
-        /* Other models still use descriptor discovery. Descriptor storage is
-         * heap aligned because it participates in IOS IPC. */
         usb_devdesc *dd = (usb_devdesc *)memalign(32, sizeof(usb_devdesc));
         if (!dd) {
-            snprintf(statusText, sizeof(statusText), "alloc desc failed");
+            diagLog("descriptor alloc failed");
             USB_CloseDevice(&fd);
             return false;
         }
         memset(dd, 0, sizeof(*dd));
 
         rc = USB_GetDescriptors(fd, dd);
+        diagLog("USB_GetDescriptors fd=%d -> %d", fd, rc);
         if (rc < 0) {
             snprintf(statusText, sizeof(statusText), "desc:%d %04x:%04x",
                      rc, entry->vid, entry->pid);
@@ -304,6 +448,8 @@ static bool tryOpen(const usb_device_entry *entry)
         }
 
         bool endpointsOk = findEndpoints(dd, &inEp, &outEp);
+        diagLog("descriptor endpoints ok=%d IN=%02x OUT=%02x",
+                endpointsOk ? 1 : 0, inEp, outEp);
         USB_FreeDescriptors(dd);
         free(dd);
 
@@ -315,15 +461,14 @@ static bool tryOpen(const usb_device_entry *entry)
         }
     }
 
-    /* Do NOT call USB_SetConfiguration/USB_SetAlternativeInterface here.
-     * IOS58 already configured the V5 device. */
-    rc = initializeXboxOne(fd, outEp);
-    if (rc < 0) {
-        snprintf(statusText, sizeof(statusText), "%s init:%d ep:%02x/%02x",
-                 directPath ? "direct" : "desc", rc, inEp, outEp);
-        USB_CloseDevice(&fd);
-        return false;
-    }
+    s32 resumeRc = USB_ResumeDevice(fd);
+    diagLog("USB_ResumeDevice fd=%d -> %d", fd, resumeRc);
+    usleep(150000);
+
+    s32 clearInRc = USB_ClearHalt(fd, inEp);
+    s32 clearOutRc = USB_ClearHalt(fd, outEp);
+    diagLog("USB_ClearHalt IN=%02x -> %d; OUT=%02x -> %d",
+            inEp, clearInRc, outEp, clearOutRc);
 
     deviceFd = fd;
     activeProfile = profile;
@@ -337,18 +482,33 @@ static bool tryOpen(const usb_device_entry *entry)
     active = true;
     memset(reportBuffer, 0, sizeof(reportBuffer));
 
-    rc = USB_ReadIntrMsgAsync(deviceFd, endpointIn, reportLength,
-                              reportBuffer, readCallback, NULL);
-    if (rc < 0) {
-        snprintf(statusText, sizeof(statusText), "%s readq:%d ep:%02x/%02x",
-                 directPath ? "direct" : "desc", rc, endpointIn, endpointOut);
+    s32 readQueueRc = USB_ReadIntrMsgAsync(deviceFd, endpointIn, reportLength,
+                                           reportBuffer, readCallback, NULL);
+    diagLog("USB_ReadIntrMsgAsync fd=%d ep=%02x len=%u -> %d",
+            fd, endpointIn, reportLength, readQueueRc);
+    if (readQueueRc < 0) {
+        snprintf(statusText, sizeof(statusText), "direct readq:%d ep:%02x/%02x",
+                 readQueueRc, endpointIn, endpointOut);
         closeController();
         return false;
     }
 
-    snprintf(statusText, sizeof(statusText), "%s connected %s ep:%02x/%02x",
-             directPath ? "direct" : "desc", profile->name,
-             endpointIn, endpointOut);
+    static const u8 powerOn[] = { 0x05, 0x20, 0x00, 0x01, 0x00 };
+    static const u8 oneSInit[] = { 0x05, 0x20, 0x00, 0x0f, 0x06 };
+
+    s32 powerRc = retryWritePacket(fd, outEp, "power-on",
+                                   powerOn, sizeof(powerOn), 12);
+    s32 oneSRc = 0;
+    if (entry->pid == XBOX_ONE_S_PID)
+        oneSRc = retryWritePacket(fd, outEp, "one-s-init",
+                                  oneSInit, sizeof(oneSInit), 6);
+
+    diagLog("OPEN COMPLETE fd=%d resume=%d clear=%d/%d readq=%d power=%d oneS=%d",
+            fd, resumeRc, clearInRc, clearOutRc, readQueueRc, powerRc, oneSRc);
+
+    snprintf(statusText, sizeof(statusText),
+             "connected diag r:%d q:%d w:%d/%d ep:%02x/%02x",
+             resumeRc, readQueueRc, powerRc, oneSRc, endpointIn, endpointOut);
     return true;
 }
 
@@ -358,6 +518,7 @@ static bool scanVendorClass(void)
         32, sizeof(usb_device_entry) * MAX_USB_DEVICES);
     if (!entries) {
         snprintf(statusText, sizeof(statusText), "alloc list failed");
+        diagLog("USB device list alloc failed");
         return false;
     }
 
@@ -365,6 +526,7 @@ static bool scanVendorClass(void)
     u8 count = 0;
     s32 rc = USB_GetDeviceList(entries, MAX_USB_DEVICES,
                                USB_CLASS_VENDOR_SPECIFIC, &count);
+    diagLog("USB_GetDeviceList class=ff -> rc=%d count=%u", rc, count);
     if (rc < 0) {
         snprintf(statusText, sizeof(statusText), "list:%d", rc);
         free(entries);
@@ -373,8 +535,12 @@ static bool scanVendorClass(void)
 
     bool sawSupported = false;
     for (u8 i = 0; i < count; ++i) {
+        diagLog("LIST[%u] device_id=%d vid=%04x pid=%04x",
+                i, entries[i].device_id, entries[i].vid, entries[i].pid);
+
         if (!findProfile(entries[i].vid, entries[i].pid))
             continue;
+
         sawSupported = true;
         if (tryOpen(&entries[i])) {
             free(entries);
@@ -394,14 +560,20 @@ static void initializeDriver(void)
     if (initialized)
         return;
 
+    diagOpen();
+    diagLog("driver init begin");
+
     initialized = true;
     active = false;
     deviceFd = -1;
     heldButtons = 0;
     closePending = false;
     asyncError = 0;
+    diagEventRead = diagEventWrite = 0;
+    diagEventsDropped = 0;
 
     s32 rc = USB_Initialize();
+    diagLog("USB_Initialize -> %d", rc);
     if (rc < 0) {
         snprintf(statusText, sizeof(statusText), "USB init:%d", rc);
         return;
@@ -414,9 +586,11 @@ static void initializeDriver(void)
 void XBOXONE_ScanPads(void)
 {
     initializeDriver();
+    drainDiagEvents();
 
     if (closePending) {
         s32 err = asyncError;
+        diagLog("closePending asyncError=%d", err);
         closeController();
         snprintf(statusText, sizeof(statusText), "disconnected read:%d", err);
         pollCountdown = 0;
@@ -429,6 +603,7 @@ void XBOXONE_ScanPads(void)
         return;
 
     pollCountdown = POLL_INTERVAL_FRAMES;
+    diagLog("poll rescan");
     scanVendorClass();
 }
 
@@ -447,6 +622,7 @@ char *XBOXONE_Status(void)
 {
     if (!initialized)
         initializeDriver();
+    drainDiagEvents();
     return statusText;
 }
 
