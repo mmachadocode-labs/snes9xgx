@@ -12,9 +12,9 @@
  * USB_GetDescriptors() returns IPC_EINVAL (-4) for the V5 vendor device on
  * the test Wii. Its known GIP endpoints are interrupt IN 0x82 and OUT 0x02.
  *
- * Diagnostic build: the main thread appends a detailed trace to
- * sd:/snes9xgx/xbox-usb.log (with fallbacks). IOS callbacks only enqueue
- * small in-memory events; the main thread drains them later.
+ * Diagnostic build: early messages are buffered in RAM because the Wii input
+ * driver is initialized before the filesystem/SD card is mounted. Once SD is
+ * available, the main thread writes the buffered trace to xbox-usb.log.
  */
 
 #include <gccore.h>
@@ -39,6 +39,7 @@
 
 #define DIAG_EVENT_COUNT 32
 #define DIAG_CAPTURE_BYTES 32
+#define DIAG_PENDING_BYTES 16384
 
 typedef struct {
     u16 pid;
@@ -74,16 +75,19 @@ static u16 reportLength = MAX_REPORT_SIZE;
 static volatile u32 heldButtons = 0;
 static volatile bool guidePressed = false;
 static int pollCountdown = 0;
-static char statusText[96] = "not found";
+static char statusText[112] = "not found";
 
 /* IOS DMAs directly into this buffer. Keep it static and 32-byte aligned. */
 static u8 ATTRIBUTE_ALIGN(32) reportBuffer[MAX_REPORT_SIZE];
 
 /* Diagnostic file is used only by the main thread. */
 static FILE *diagFile = NULL;
-static bool diagFileTried = false;
 static u32 diagSequence = 0;
 static u32 diagPositiveReadsLogged = 0;
+static char diagPending[DIAG_PENDING_BYTES];
+static size_t diagPendingLen = 0;
+static u32 diagPendingDropped = 0;
+static char diagOpenedPath[64] = "RAM only";
 
 /* Callback -> main-thread ring buffer. No file I/O from the IOS callback. */
 static diag_event diagEvents[DIAG_EVENT_COUNT];
@@ -91,12 +95,35 @@ static volatile u32 diagEventWrite = 0;
 static volatile u32 diagEventRead = 0;
 static volatile u32 diagEventsDropped = 0;
 
-static void diagOpen(void)
+static void diagQueueBytes(const char *data, size_t len)
 {
-    if (diagFile || diagFileTried)
+    if (!data || !len)
         return;
 
-    diagFileTried = true;
+    if (len > sizeof(diagPending) - diagPendingLen) {
+        size_t room = sizeof(diagPending) - diagPendingLen;
+        if (room) {
+            memcpy(diagPending + diagPendingLen, data, room);
+            diagPendingLen += room;
+        }
+        diagPendingDropped++;
+        return;
+    }
+
+    memcpy(diagPending + diagPendingLen, data, len);
+    diagPendingLen += len;
+}
+
+/*
+ * The input driver comes up before WiiFileSystemDriver::init(), so fopen()
+ * commonly fails during the first Xbox scan. Do not latch that failure.
+ * Retry from the normal main-thread polling path until SD becomes available.
+ */
+static bool diagTryOpen(void)
+{
+    if (diagFile)
+        return true;
+
     const char *paths[] = {
         "sd:/snes9xgx/xbox-usb.log",
         "sd:/xbox-usb.log",
@@ -105,32 +132,78 @@ static void diagOpen(void)
     };
 
     for (unsigned i = 0; i < sizeof(paths) / sizeof(paths[0]); ++i) {
-        diagFile = fopen(paths[i], "a");
-        if (diagFile) {
-            setvbuf(diagFile, NULL, _IOLBF, 0);
-            fprintf(diagFile, "\n===== Xbox USB diagnostic session (IOS %u) =====\n",
-                    (unsigned)IOS_GetVersion());
-            fflush(diagFile);
-            break;
+        FILE *f = fopen(paths[i], "w");
+        if (!f)
+            continue;
+
+        /* Diagnostic build: unbuffered writes make every completed line durable. */
+        setvbuf(f, NULL, _IONBF, 0);
+
+        if (diagPendingLen) {
+            size_t n = fwrite(diagPending, 1, diagPendingLen, f);
+            if (n != diagPendingLen) {
+                fclose(f);
+                continue;
+            }
         }
+
+        diagFile = f;
+        strncpy(diagOpenedPath, paths[i], sizeof(diagOpenedPath) - 1);
+        diagOpenedPath[sizeof(diagOpenedPath) - 1] = 0;
+        diagPendingLen = 0;
+
+        fprintf(diagFile, "[diag] file opened: %s\n", diagOpenedPath);
+        if (diagPendingDropped)
+            fprintf(diagFile, "[diag] RAM log overflow before mount: dropped=%u\n",
+                    (unsigned)diagPendingDropped);
+        return true;
     }
+
+    return false;
 }
 
 static void diagLog(const char *fmt, ...)
 {
-    diagOpen();
-    if (!diagFile)
+    char line[512];
+    int prefix = snprintf(line, sizeof(line), "[%06u] ", (unsigned)diagSequence++);
+    if (prefix < 0)
         return;
-
-    fprintf(diagFile, "[%06u] ", (unsigned)diagSequence++);
+    if ((size_t)prefix >= sizeof(line))
+        prefix = sizeof(line) - 1;
 
     va_list ap;
     va_start(ap, fmt);
-    vfprintf(diagFile, fmt, ap);
+    int body = vsnprintf(line + prefix, sizeof(line) - (size_t)prefix, fmt, ap);
     va_end(ap);
 
-    fputc('\n', diagFile);
-    fflush(diagFile);
+    size_t len;
+    if (body < 0)
+        len = (size_t)prefix;
+    else {
+        size_t wanted = (size_t)prefix + (size_t)body;
+        len = wanted < sizeof(line) ? wanted : sizeof(line) - 1;
+    }
+
+    if (len + 1 < sizeof(line))
+        line[len++] = '\n';
+    else {
+        line[sizeof(line) - 2] = '\n';
+        len = sizeof(line) - 1;
+    }
+
+    if (diagTryOpen()) {
+        size_t n = fwrite(line, 1, len, diagFile);
+        if (n == len)
+            return;
+
+        /* Storage disappeared or write failed. Preserve future lines in RAM. */
+        fclose(diagFile);
+        diagFile = NULL;
+        strncpy(diagOpenedPath, "RAM after write failure", sizeof(diagOpenedPath) - 1);
+        diagOpenedPath[sizeof(diagOpenedPath) - 1] = 0;
+    }
+
+    diagQueueBytes(line, len);
 }
 
 static void drainDiagEvents(void)
@@ -316,6 +389,7 @@ static void closeController(void)
     closePending = false;
 }
 
+/* Prefer the Xbox GIP FF/47/D0 interface, then first interrupt IN/OUT pair. */
 static bool findEndpoints(usb_devdesc *dd, u8 *inEp, u8 *outEp)
 {
     if (!dd || !inEp || !outEp)
@@ -560,7 +634,9 @@ static void initializeDriver(void)
     if (initialized)
         return;
 
-    diagOpen();
+    /* These lines will stay in RAM until the SD filesystem is mounted. */
+    diagLog("===== Xbox USB diagnostic session (IOS %u) =====",
+            (unsigned)IOS_GetVersion());
     diagLog("driver init begin");
 
     initialized = true;
@@ -586,6 +662,10 @@ static void initializeDriver(void)
 void XBOXONE_ScanPads(void)
 {
     initializeDriver();
+
+    /* Filesystem initialization happens after input initialization. Keep
+     * retrying here from the normal main thread until SD becomes writable. */
+    diagTryOpen();
     drainDiagEvents();
 
     if (closePending) {
@@ -622,7 +702,15 @@ char *XBOXONE_Status(void)
 {
     if (!initialized)
         initializeDriver();
+    diagTryOpen();
     drainDiagEvents();
+
+    /* If the SD still is not mounted, make that visible in Credits. */
+    if (!diagFile && strstr(statusText, "diag") == NULL) {
+        static char statusWithLog[112];
+        snprintf(statusWithLog, sizeof(statusWithLog), "%s log:RAM", statusText);
+        return statusWithLog;
+    }
     return statusText;
 }
 
