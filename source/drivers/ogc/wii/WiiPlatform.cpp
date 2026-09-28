@@ -159,11 +159,16 @@ void WiiPlatform::init(const PlatformConfig& config)
 	this->audioDriver = new WiiAudioDriver();
 	this->audioDriver->init();
 
-	this->inputDriver = new OgcInputDriver();
-	this->inputDriver->init();
-
+	/*
+	 * Mount writable storage before input initialization. The Xbox diagnostic
+	 * driver can run its first USB scan from OgcInputDriver::init(), and its
+	 * trace must already have a valid sd:/ filesystem at that point.
+	 */
 	this->fileSystemDriver = new WiiFileSystemDriver();
 	this->fileSystemDriver->init();
+
+	this->inputDriver = new OgcInputDriver();
+	this->inputDriver->init();
 
 #if LOGGING_ENABLED
 	this->logger = new Logger();
@@ -209,7 +214,7 @@ void WiiPlatform::shutdown()
 	if (audioDriver) {
 		audioDriver->shutdown();
 		delete audioDriver;
-		audioDriver = nullptr;
+		this->audioDriver = nullptr;
 	}
 
 	if (videoDriver) {
