@@ -3,22 +3,19 @@
 /*
  * Wired Xbox One input for Snes9x GX.
  *
- * USB transport/lifetime handling is adapted from Mayo1970/ioQuake3-wii's
- * code/input/wii_usb_hid.c (GPLv2). IOS IPC buffers are 32-byte aligned,
- * hotplug is polled, and callbacks never close/reopen a USB device.
+ * Xbox One S 045e:02ea uses GIP on interface FF/47/D0 with interrupt
+ * endpoints OUT 0x02 and IN 0x82.
  *
- * Xbox One S (045e:02ea) uses a descriptor-less fast path on IOS58 because
- * USB_GetDescriptors() returns IPC_EINVAL (-4) for the V5 vendor device on
- * the test Wii. Its known GIP endpoints are IN 0x82 and OUT 0x02.
+ * Important IOS58/libogc2 V5 detail: /dev/usb/ven exposes each USB interface
+ * as a separate device_id, while USB_GetDeviceList() cannot really filter the
+ * vendor host by interface class. Therefore VID/PID alone is not enough: the
+ * same physical controller can appear several times. V22 probes descriptors
+ * BEFORE USB_OpenDevice(), selects the FF/47/D0 interface, and only then opens
+ * that specific V5 device_id.
  *
- * V21 follows Linux xpad's ordering more closely:
- *   1. open the controller;
- *   2. arm interrupt IN before any GIP output;
- *   3. send GIP init packets asynchronously;
- *   4. advance to the next packet only after a successful completion;
- *   5. retry NAKs at a low rate instead of closing/reopening the device.
- *
- * No filesystem logging and no USB_ResumeDevice/USB_ClearHalt calls are used.
+ * The GIP bring-up itself follows Linux xpad ordering: arm interrupt IN first,
+ * then send the output init sequence asynchronously. Output NAKs are retried
+ * without closing the controller. No filesystem logging is used.
  */
 
 #include <gccore.h>
@@ -30,7 +27,7 @@
 #define MICROSOFT_VID 0x045e
 #define XBOX_ONE_S_PID 0x02ea
 #define USB_CLASS_VENDOR_SPECIFIC 0xff
-#define MAX_USB_DEVICES 16
+#define MAX_USB_DEVICES 24
 #define MAX_REPORT_SIZE 64
 #define POLL_INTERVAL_FRAMES 60
 #define RETRY_INTERVAL_FRAMES 15
@@ -59,8 +56,7 @@ static bool initialized = false;
 static volatile bool active = false;
 static volatile bool closePending = false;
 static volatile s32 asyncError = 0;
-/* IOS58 V5 vendor device IDs are valid negative numbers. -1 is our sentinel. */
-static volatile s32 deviceFd = -1;
+static volatile s32 deviceFd = -1; /* negative V5 ids are valid; -1 is sentinel */
 static const xbox_profile *activeProfile = NULL;
 static u8 endpointIn = 0;
 static u8 endpointOut = 0;
@@ -68,14 +64,17 @@ static u16 reportLength = MAX_REPORT_SIZE;
 static volatile u32 heldButtons = 0;
 static volatile bool guidePressed = false;
 static int pollCountdown = 0;
-static char statusText[128] = "not found";
+static char statusText[144] = "not found";
 
-/* RAM-only diagnostics exposed in Credits. */
+/* RAM-only diagnostics shown in Credits. */
 static s32 lastFd = -1;
-static s32 lastReadQueueRc = 0;
-static volatile s32 lastReadCallbackRc = 999;
-static s32 lastWriteSubmitRc = 999;
+static s32 lastProbeRc = 999;
+static u8 selectedListIndex = 0xff;
+static u8 selectedInterface = 0xff;
+static u8 matchingEntries = 0;
+static s32 lastReadQueueRc = 999;
 static volatile s32 lastWriteCompletionRc = 999;
+static s32 lastWriteSubmitRc = 999;
 static volatile u32 rxPackets = 0;
 static volatile u8 lastRxCommand = 0;
 static u32 initRetries = 0;
@@ -92,7 +91,6 @@ static int initStage = 0; /* 0 power, 1 One-S, 2 LED, 3 auth, 4 done */
 static u8 initSerial = 0;
 static int initRetryCountdown = 0;
 
-/* If an interrupt-IN queue attempt gets NAKed, retry from the main loop. */
 static bool readRetryPending = false;
 static int readRetryCountdown = 0;
 
@@ -176,7 +174,6 @@ static void parseXboxOneReport(const u8 *d, u16 len)
 static s32 readCallback(s32 result, void *userdata)
 {
     (void)userdata;
-    lastReadCallbackRc = result;
 
     if (result < 0) {
         if (result == USB_NAK_RC) {
@@ -238,58 +235,68 @@ static void closeController(void)
     closePending = false;
 }
 
-/* Prefer Xbox GIP FF/47/D0, then fall back to first interrupt IN/OUT pair. */
-static bool findEndpoints(usb_devdesc *dd, u8 *inEp, u8 *outEp)
+/*
+ * Probe a V5 device_id before USB_OpenDevice(). IOS58 /dev/usb/ven presents
+ * one interface per device_id, so this is how we distinguish the GIP data
+ * interface from the controller's other vendor/audio interfaces.
+ */
+static bool probeGipInterface(const usb_device_entry *entry,
+                              u8 *inEp, u8 *outEp, u8 *interfaceNumber)
 {
-    if (!dd || !inEp || !outEp)
-        return false;
-
     *inEp = 0;
     *outEp = 0;
+    *interfaceNumber = 0xff;
 
-    for (u8 c = 0; c < dd->bNumConfigurations; ++c) {
+    usb_devdesc *dd = (usb_devdesc *)memalign(32, sizeof(usb_devdesc));
+    if (!dd) {
+        lastProbeRc = -12;
+        return false;
+    }
+    memset(dd, 0, sizeof(*dd));
+
+    s32 rc = USB_GetDescriptors(entry->device_id, dd);
+    lastProbeRc = rc;
+    if (rc < 0) {
+        free(dd);
+        return false;
+    }
+
+    bool found = false;
+    for (u8 c = 0; c < dd->bNumConfigurations && !found; ++c) {
         usb_configurationdesc *cd = &dd->configurations[c];
-        for (u8 i = 0; i < cd->bNumInterfaces; ++i) {
+        for (u8 i = 0; i < cd->bNumInterfaces && !found; ++i) {
             usb_interfacedesc *id = &cd->interfaces[i];
+
             if (id->bInterfaceClass != 0xff ||
                 id->bInterfaceSubClass != 0x47 ||
                 id->bInterfaceProtocol != 0xd0)
                 continue;
 
+            u8 candidateIn = 0;
+            u8 candidateOut = 0;
             for (u8 e = 0; e < id->bNumEndpoints; ++e) {
                 usb_endpointdesc *ep = &id->endpoints[e];
                 if ((ep->bmAttributes & 0x03) != USB_ENDPOINT_INTERRUPT)
                     continue;
+
                 if (ep->bEndpointAddress & USB_ENDPOINT_IN)
-                    *inEp = ep->bEndpointAddress;
+                    candidateIn = ep->bEndpointAddress;
                 else
-                    *outEp = ep->bEndpointAddress;
+                    candidateOut = ep->bEndpointAddress;
             }
-            if (*inEp && *outEp)
-                return true;
+
+            if (candidateIn && candidateOut) {
+                *inEp = candidateIn;
+                *outEp = candidateOut;
+                *interfaceNumber = id->bInterfaceNumber;
+                found = true;
+            }
         }
     }
 
-    *inEp = *outEp = 0;
-    for (u8 c = 0; c < dd->bNumConfigurations; ++c) {
-        usb_configurationdesc *cd = &dd->configurations[c];
-        for (u8 i = 0; i < cd->bNumInterfaces; ++i) {
-            usb_interfacedesc *id = &cd->interfaces[i];
-            for (u8 e = 0; e < id->bNumEndpoints; ++e) {
-                usb_endpointdesc *ep = &id->endpoints[e];
-                if ((ep->bmAttributes & 0x03) != USB_ENDPOINT_INTERRUPT)
-                    continue;
-                if ((ep->bEndpointAddress & USB_ENDPOINT_IN) && !*inEp)
-                    *inEp = ep->bEndpointAddress;
-                else if (!(ep->bEndpointAddress & USB_ENDPOINT_IN) && !*outEp)
-                    *outEp = ep->bEndpointAddress;
-            }
-            if (*inEp && *outEp)
-                return true;
-        }
-    }
-
-    return *inEp != 0;
+    USB_FreeDescriptors(dd);
+    free(dd);
+    return found;
 }
 
 static bool prepareInitPacket(void)
@@ -346,9 +353,8 @@ static void submitCurrentInitPacket(void)
     if (!prepareInitPacket())
         return;
 
-    s32 rc = USB_WriteIntrMsgAsync(deviceFd, endpointOut,
-                                   (initStage == 2) ? 7 :
-                                   (initStage == 3) ? 6 : 5,
+    u16 len = (initStage == 2) ? 7 : (initStage == 3) ? 6 : 5;
+    s32 rc = USB_WriteIntrMsgAsync(deviceFd, endpointOut, len,
                                    outputBuffer, writeCallback, NULL);
     lastWriteSubmitRc = rc;
 
@@ -423,60 +429,27 @@ static void updateStatus(void)
         return;
 
     snprintf(statusText, sizeof(statusText),
-             "x1s fd:%d q:%d w:%d/%d s:%d n:%u rx:%u c:%02x",
-             lastFd, lastReadQueueRc,
-             lastWriteSubmitRc, (s32)lastWriteCompletionRc,
-             initStage, (unsigned)initRetries,
-             (unsigned)rxPackets, (unsigned)lastRxCommand);
+             "x1s m:%u e:%u if:%u d:%d fd:%d q:%d w:%d/%d s:%d n:%u rx:%u c:%02x",
+             (unsigned)matchingEntries, (unsigned)selectedListIndex,
+             (unsigned)selectedInterface, lastProbeRc, lastFd,
+             lastReadQueueRc, lastWriteSubmitRc,
+             (s32)lastWriteCompletionRc, initStage,
+             (unsigned)initRetries, (unsigned)rxPackets,
+             (unsigned)lastRxCommand);
 }
 
-static bool tryOpen(const usb_device_entry *entry)
+static bool openSelectedEntry(const usb_device_entry *entry,
+                              const xbox_profile *profile,
+                              u8 inEp, u8 outEp,
+                              u8 interfaceNumber, u8 listIndex)
 {
-    const xbox_profile *profile = findProfile(entry->vid, entry->pid);
-    if (!profile)
-        return false;
-
     s32 fd = -1;
     s32 rc = USB_OpenDevice(entry->device_id, entry->vid, entry->pid, &fd);
     lastFd = fd;
     if (rc < 0) {
-        snprintf(statusText, sizeof(statusText), "open:%d %04x:%04x",
-                 rc, entry->vid, entry->pid);
+        snprintf(statusText, sizeof(statusText),
+                 "open:%d e:%u d:%d", rc, (unsigned)listIndex, lastProbeRc);
         return false;
-    }
-
-    u8 inEp = 0;
-    u8 outEp = 0;
-    bool directPath = entry->vid == MICROSOFT_VID && entry->pid == XBOX_ONE_S_PID;
-
-    if (directPath) {
-        inEp = 0x82;
-        outEp = 0x02;
-    } else {
-        usb_devdesc *dd = (usb_devdesc *)memalign(32, sizeof(usb_devdesc));
-        if (!dd) {
-            USB_CloseDevice(&fd);
-            return false;
-        }
-        memset(dd, 0, sizeof(*dd));
-
-        rc = USB_GetDescriptors(fd, dd);
-        if (rc < 0) {
-            snprintf(statusText, sizeof(statusText), "desc:%d %04x:%04x",
-                     rc, entry->vid, entry->pid);
-            USB_CloseDevice(&fd);
-            free(dd);
-            return false;
-        }
-
-        bool endpointsOk = findEndpoints(dd, &inEp, &outEp);
-        USB_FreeDescriptors(dd);
-        free(dd);
-
-        if (!endpointsOk || !inEp || !outEp) {
-            USB_CloseDevice(&fd);
-            return false;
-        }
     }
 
     deviceFd = fd;
@@ -484,6 +457,8 @@ static bool tryOpen(const usb_device_entry *entry)
     endpointIn = inEp;
     endpointOut = outEp;
     reportLength = MAX_REPORT_SIZE;
+    selectedListIndex = listIndex;
+    selectedInterface = interfaceNumber;
     heldButtons = 0;
     guidePressed = false;
     asyncError = 0;
@@ -491,7 +466,6 @@ static bool tryOpen(const usb_device_entry *entry)
     active = true;
 
     lastReadQueueRc = 999;
-    lastReadCallbackRc = 999;
     lastWriteSubmitRc = 999;
     lastWriteCompletionRc = 999;
     rxPackets = 0;
@@ -505,7 +479,7 @@ static bool tryOpen(const usb_device_entry *entry)
     readRetryPending = false;
     readRetryCountdown = 0;
 
-    /* Linux xpad starts interrupt IN before beginning Xbox One GIP init. */
+    /* Linux xpad arms input before starting the Xbox One output init. */
     memset(reportBuffer, 0, sizeof(reportBuffer));
     rc = USB_ReadIntrMsgAsync(deviceFd, endpointIn, reportLength,
                               reportBuffer, readCallback, NULL);
@@ -516,14 +490,13 @@ static bool tryOpen(const usb_device_entry *entry)
             readRetryCountdown = RETRY_INTERVAL_FRAMES;
         } else {
             snprintf(statusText, sizeof(statusText),
-                     "readq:%d fd:%d ep:%02x/%02x",
-                     rc, fd, endpointIn, endpointOut);
+                     "readq:%d e:%u if:%u", rc,
+                     (unsigned)listIndex, (unsigned)interfaceNumber);
             closeController();
             return false;
         }
     }
 
-    /* Do not fail/close on output NAK. Keep IN alive and retry slowly. */
     submitCurrentInitPacket();
     updateStatus();
     return true;
@@ -548,18 +521,36 @@ static bool scanVendorClass(void)
         return false;
     }
 
-    bool sawSupported = false;
+    matchingEntries = 0;
+    lastProbeRc = 999;
+
     for (u8 i = 0; i < count; ++i) {
-        if (!findProfile(entries[i].vid, entries[i].pid))
+        const xbox_profile *profile = findProfile(entries[i].vid, entries[i].pid);
+        if (!profile)
             continue;
-        sawSupported = true;
-        if (tryOpen(&entries[i])) {
+
+        matchingEntries++;
+
+        u8 inEp = 0;
+        u8 outEp = 0;
+        u8 interfaceNumber = 0xff;
+
+        /* Critical V22 change: inspect this V5 interface before opening it. */
+        if (!probeGipInterface(&entries[i], &inEp, &outEp, &interfaceNumber))
+            continue;
+
+        if (openSelectedEntry(&entries[i], profile,
+                              inEp, outEp, interfaceNumber, i)) {
             free(entries);
             return true;
         }
     }
 
-    if (!sawSupported)
+    if (matchingEntries)
+        snprintf(statusText, sizeof(statusText),
+                 "Xbox interfaces:%u no GIP d:%d",
+                 (unsigned)matchingEntries, lastProbeRc);
+    else
         snprintf(statusText, sizeof(statusText), "not found (%u USB)", count);
 
     free(entries);
