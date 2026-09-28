@@ -8,10 +8,13 @@
  * device-change entry also carries the interface number in usb_device_entry's
  * token field (raw byte 10 => token bits 15..8 on PPC).
  *
- * V22 tried USB_GetDescriptors() before opening the entry, but IOS58 requires
- * the interface to be resumed first, so that probe returned IPC_EINVAL (-4).
- * V23 selects interface 0 directly from the V5 token. Xbox One S GIP is
- * interface 0 (FF/47/D0), with interrupt IN 0x82 and OUT 0x02.
+ * V23 confirmed interface 0 (FF/47/D0), interrupt IN 0x82 and OUT 0x02, but
+ * every GIP interrupt-OUT completion still returned -7005/NAK.
+ *
+ * V24 fixes an IOS58 V5 requirement that the application transfer buffers
+ * passed to /dev/usb/ven live in MEM2 as well as being 32-byte aligned. The
+ * previous static .bss buffers were aligned but normally lived in MEM1.
+ * Both persistent async buffers are therefore reserved from Arena2/MEM2.
  *
  * USB_OpenDevice() in libogc2 resumes V5 VEN devices internally. The GIP
  * bring-up follows Linux xpad ordering: arm interrupt IN first, then send the
@@ -20,6 +23,7 @@
  */
 
 #include <gccore.h>
+#include <ogc/system.h>
 #include <ogc/usb.h>
 #include <malloc.h>
 #include <stdio.h>
@@ -68,7 +72,7 @@ static u16 reportLength = MAX_REPORT_SIZE;
 static volatile u32 heldButtons = 0;
 static volatile bool guidePressed = false;
 static int pollCountdown = 0;
-static char statusText[160] = "not found";
+static char statusText[192] = "not found";
 
 /* RAM-only diagnostics shown in Credits. */
 static s32 lastFd = -1;
@@ -84,9 +88,14 @@ static volatile u32 rxPackets = 0;
 static volatile u8 lastRxCommand = 0;
 static u32 initRetries = 0;
 
-/* IOS DMA buffers must remain valid and 32-byte aligned for async transfers. */
-static u8 ATTRIBUTE_ALIGN(32) reportBuffer[MAX_REPORT_SIZE];
-static u8 ATTRIBUTE_ALIGN(32) outputBuffer[MAX_REPORT_SIZE];
+/*
+ * /dev/usb/ven requires application transfer buffers in MEM2 and 32-byte
+ * aligned. Reserve one permanent 128-byte Arena2 block and split it into two
+ * 64-byte buffers. Arena allocations are intentionally kept for app lifetime.
+ */
+static u8 *usbBufferBlock = NULL;
+static u8 *reportBuffer = NULL;
+static u8 *outputBuffer = NULL;
 
 /* xpad-style output init state. */
 static volatile bool writeInFlight = false;
@@ -98,6 +107,24 @@ static int initRetryCountdown = 0;
 
 static bool readRetryPending = false;
 static int readRetryCountdown = 0;
+
+static bool allocateUsbBuffers(void)
+{
+    if (reportBuffer && outputBuffer)
+        return true;
+
+    usbBufferBlock = (u8 *)SYS_AllocArenaMem2Lo(MAX_REPORT_SIZE * 2, 32);
+    if (!usbBufferBlock) {
+        snprintf(statusText, sizeof(statusText), "MEM2 USB buffer alloc failed");
+        return false;
+    }
+
+    reportBuffer = usbBufferBlock;
+    outputBuffer = usbBufferBlock + MAX_REPORT_SIZE;
+    memset(reportBuffer, 0, MAX_REPORT_SIZE);
+    memset(outputBuffer, 0, MAX_REPORT_SIZE);
+    return true;
+}
 
 static const xbox_profile *findProfile(u16 vid, u16 pid)
 {
@@ -294,10 +321,10 @@ static bool prepareInitPacket(void)
         break;
     }
 
-    if (!data || !len)
+    if (!data || !len || !outputBuffer)
         return false;
 
-    memset(outputBuffer, 0, sizeof(outputBuffer));
+    memset(outputBuffer, 0, MAX_REPORT_SIZE);
     memcpy(outputBuffer, data, len);
     outputBuffer[2] = initSerial;
     return true;
@@ -305,7 +332,8 @@ static bool prepareInitPacket(void)
 
 static void submitCurrentInitPacket(void)
 {
-    if (!active || deviceFd == -1 || !endpointOut || writeInFlight || initStage >= 4)
+    if (!active || deviceFd == -1 || !endpointOut || !outputBuffer ||
+        writeInFlight || initStage >= 4)
         return;
 
     if (!prepareInitPacket())
@@ -358,7 +386,7 @@ static void processInitState(void)
 
 static void processReadRetry(void)
 {
-    if (!active || !readRetryPending || deviceFd == -1)
+    if (!active || !readRetryPending || deviceFd == -1 || !reportBuffer)
         return;
 
     if (readRetryCountdown > 0) {
@@ -366,7 +394,7 @@ static void processReadRetry(void)
         return;
     }
 
-    memset(reportBuffer, 0, sizeof(reportBuffer));
+    memset(reportBuffer, 0, MAX_REPORT_SIZE);
     s32 rc = USB_ReadIntrMsgAsync(deviceFd, endpointIn, reportLength,
                                   reportBuffer, readCallback, NULL);
     lastReadQueueRc = rc;
@@ -387,13 +415,13 @@ static void updateStatus(void)
         return;
 
     snprintf(statusText, sizeof(statusText),
-             "x1s m:%u e:%u if:%u a:%u t:%08x fd:%d q:%d w:%d/%d s:%d n:%u rx:%u c:%02x",
-             (unsigned)matchingEntries, (unsigned)selectedListIndex,
-             (unsigned)selectedInterface, (unsigned)selectedAltCount,
-             (unsigned)selectedToken, lastFd, lastReadQueueRc,
-             lastWriteSubmitRc, (s32)lastWriteCompletionRc,
-             initStage, (unsigned)initRetries,
-             (unsigned)rxPackets, (unsigned)lastRxCommand);
+             "x1s e:%u if:%u M2:%08x/%08x q:%d w:%d/%d s:%d n:%u rx:%u c:%02x",
+             (unsigned)selectedListIndex, (unsigned)selectedInterface,
+             (unsigned)(u32)reportBuffer, (unsigned)(u32)outputBuffer,
+             lastReadQueueRc, lastWriteSubmitRc,
+             (s32)lastWriteCompletionRc, initStage,
+             (unsigned)initRetries, (unsigned)rxPackets,
+             (unsigned)lastRxCommand);
 }
 
 static bool openSelectedEntry(const usb_device_entry *entry,
@@ -441,7 +469,7 @@ static bool openSelectedEntry(const usb_device_entry *entry,
     readRetryCountdown = 0;
 
     /* Linux xpad arms input before starting the Xbox One output init. */
-    memset(reportBuffer, 0, sizeof(reportBuffer));
+    memset(reportBuffer, 0, MAX_REPORT_SIZE);
     rc = USB_ReadIntrMsgAsync(deviceFd, endpointIn, reportLength,
                               reportBuffer, readCallback, NULL);
     lastReadQueueRc = rc;
@@ -533,6 +561,9 @@ static void initializeDriver(void)
     heldButtons = 0;
     closePending = false;
     asyncError = 0;
+
+    if (!allocateUsbBuffers())
+        return;
 
     s32 rc = USB_Initialize();
     if (rc < 0) {
