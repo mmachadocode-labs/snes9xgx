@@ -5,17 +5,20 @@
  *
  * USB transport/lifetime handling is adapted from Mayo1970/ioQuake3-wii's
  * code/input/wii_usb_hid.c (GPLv2). IOS IPC buffers are 32-byte aligned,
- * hotplug is polled, and the async read callback never closes/reopens a USB
- * device itself.
+ * hotplug is polled, and callbacks never close/reopen a USB device.
  *
- * Xbox One S (045e:02ea) uses a descriptor-less fast path on IOS58. On the
- * test Wii, USB_GetDescriptors() returns IPC_EINVAL (-4) for this V5 vendor
- * device even though USB_OpenDevice() succeeds. Its known GIP endpoints are
- * interrupt IN 0x82 and interrupt OUT 0x02, 64-byte packets.
+ * Xbox One S (045e:02ea) uses a descriptor-less fast path on IOS58 because
+ * USB_GetDescriptors() returns IPC_EINVAL (-4) for the V5 vendor device on
+ * the test Wii. Its known GIP endpoints are IN 0x82 and OUT 0x02.
  *
- * V19 intentionally avoids filesystem logging and retry loops. Diagnostics
- * stay in RAM and are exposed through Credits so the USB path remains close
- * to the stable V15 behavior.
+ * V21 follows Linux xpad's ordering more closely:
+ *   1. open the controller;
+ *   2. arm interrupt IN before any GIP output;
+ *   3. send GIP init packets asynchronously;
+ *   4. advance to the next packet only after a successful completion;
+ *   5. retry NAKs at a low rate instead of closing/reopening the device.
+ *
+ * No filesystem logging and no USB_ResumeDevice/USB_ClearHalt calls are used.
  */
 
 #include <gccore.h>
@@ -30,8 +33,10 @@
 #define MAX_USB_DEVICES 16
 #define MAX_REPORT_SIZE 64
 #define POLL_INTERVAL_FRAMES 60
+#define RETRY_INTERVAL_FRAMES 15
 #define STICK_THRESHOLD 16384
 #define TRIGGER_THRESHOLD 128
+#define USB_NAK_RC (-7005)
 
 #define GIP_CMD_INPUT       0x20
 #define GIP_CMD_VIRTUAL_KEY 0x07
@@ -54,7 +59,7 @@ static bool initialized = false;
 static volatile bool active = false;
 static volatile bool closePending = false;
 static volatile s32 asyncError = 0;
-/* IOS58 V5 vendor device IDs are valid negative numbers. -1 is only our sentinel. */
+/* IOS58 V5 vendor device IDs are valid negative numbers. -1 is our sentinel. */
 static volatile s32 deviceFd = -1;
 static const xbox_profile *activeProfile = NULL;
 static u8 endpointIn = 0;
@@ -65,16 +70,31 @@ static volatile bool guidePressed = false;
 static int pollCountdown = 0;
 static char statusText[128] = "not found";
 
-/* RAM-only diagnostics. No file I/O in this driver. */
-static s32 lastDeviceId = 0;
+/* RAM-only diagnostics exposed in Credits. */
 static s32 lastFd = -1;
-static s32 lastOpenRc = 0;
-static s32 lastResumeRc = 0;
-static s32 lastWriteRc = 0;
 static s32 lastReadQueueRc = 0;
+static volatile s32 lastReadCallbackRc = 999;
+static s32 lastWriteSubmitRc = 999;
+static volatile s32 lastWriteCompletionRc = 999;
+static volatile u32 rxPackets = 0;
+static volatile u8 lastRxCommand = 0;
+static u32 initRetries = 0;
 
-/* IOS DMAs directly into this buffer. Keep it static and 32-byte aligned. */
+/* IOS DMA buffers must remain valid and 32-byte aligned for async transfers. */
 static u8 ATTRIBUTE_ALIGN(32) reportBuffer[MAX_REPORT_SIZE];
+static u8 ATTRIBUTE_ALIGN(32) outputBuffer[MAX_REPORT_SIZE];
+
+/* xpad-style output init state. */
+static volatile bool writeInFlight = false;
+static volatile bool writeResultPending = false;
+static volatile s32 pendingWriteResult = 0;
+static int initStage = 0; /* 0 power, 1 One-S, 2 LED, 3 auth, 4 done */
+static u8 initSerial = 0;
+static int initRetryCountdown = 0;
+
+/* If an interrupt-IN queue attempt gets NAKed, retry from the main loop. */
+static bool readRetryPending = false;
+static int readRetryCountdown = 0;
 
 static const xbox_profile *findProfile(u16 vid, u16 pid)
 {
@@ -103,7 +123,9 @@ static void parseXboxOneReport(const u8 *d, u16 len)
     if (!d || len < 5)
         return;
 
-    /* Xbox/Guide is delivered as a separate GIP virtual-key packet. */
+    lastRxCommand = d[0];
+    rxPackets++;
+
     if (d[0] == GIP_CMD_VIRTUAL_KEY) {
         guidePressed = (d[4] & 0x01) != 0;
         return;
@@ -117,7 +139,6 @@ static void parseXboxOneReport(const u8 *d, u16 len)
     if (d[4] & 0x04) buttons |= PAD_BUTTON_START;
     if (d[4] & 0x08) buttons |= PAD_TRIGGER_Z;
 
-    /* Preserve Snes9x GX's Nintendo-style face-button placement. */
     if (d[4] & 0x10) buttons |= PAD_BUTTON_B; /* Xbox A -> SNES B */
     if (d[4] & 0x20) buttons |= PAD_BUTTON_A; /* Xbox B -> SNES A */
     if (d[4] & 0x40) buttons |= PAD_BUTTON_Y; /* Xbox X -> SNES Y */
@@ -155,25 +176,46 @@ static void parseXboxOneReport(const u8 *d, u16 len)
 static s32 readCallback(s32 result, void *userdata)
 {
     (void)userdata;
+    lastReadCallbackRc = result;
 
     if (result < 0) {
-        asyncError = result;
-        closePending = true;
+        if (result == USB_NAK_RC) {
+            readRetryPending = true;
+            readRetryCountdown = RETRY_INTERVAL_FRAMES;
+        } else {
+            asyncError = result;
+            closePending = true;
+        }
         return 0;
     }
 
     if (result > 0)
         parseXboxOneReport(reportBuffer, (u16)result);
 
-    /* V5 vendor IDs are negative, so never test deviceFd >= 0 here. */
     if (active && deviceFd != -1) {
         s32 rc = USB_ReadIntrMsgAsync(deviceFd, endpointIn, reportLength,
                                       reportBuffer, readCallback, NULL);
+        lastReadQueueRc = rc;
         if (rc < 0) {
-            asyncError = rc;
-            closePending = true;
+            if (rc == USB_NAK_RC) {
+                readRetryPending = true;
+                readRetryCountdown = RETRY_INTERVAL_FRAMES;
+            } else {
+                asyncError = rc;
+                closePending = true;
+            }
         }
     }
+    return 0;
+}
+
+static s32 writeCallback(s32 result, void *userdata)
+{
+    (void)userdata;
+    lastWriteCompletionRc = result;
+    pendingWriteResult = result;
+    writeInFlight = false;
+    writeResultPending = true;
     return 0;
 }
 
@@ -182,6 +224,9 @@ static void closeController(void)
     s32 fd = deviceFd;
     active = false;
     deviceFd = -1;
+    writeInFlight = false;
+    writeResultPending = false;
+    readRetryPending = false;
 
     if (fd != -1)
         USB_CloseDevice(&fd);
@@ -193,8 +238,7 @@ static void closeController(void)
     closePending = false;
 }
 
-/* Prefer the Xbox GIP interface FF/47/D0, then fall back to the first pair of
- * interrupt endpoints exactly like the generic ioQuake3-wii implementation. */
+/* Prefer Xbox GIP FF/47/D0, then fall back to first interrupt IN/OUT pair. */
 static bool findEndpoints(usb_devdesc *dd, u8 *inEp, u8 *outEp)
 {
     if (!dd || !inEp || !outEp)
@@ -248,22 +292,142 @@ static bool findEndpoints(usb_devdesc *dd, u8 *inEp, u8 *outEp)
     return *inEp != 0;
 }
 
-static s32 initializeXboxOne(s32 fd, u8 outEp)
+static bool prepareInitPacket(void)
 {
     static const u8 powerOn[] = { 0x05, 0x20, 0x00, 0x01, 0x00 };
+    static const u8 oneSInit[] = { 0x05, 0x20, 0x00, 0x0f, 0x06 };
+    static const u8 ledOn[] = { 0x0a, 0x20, 0x00, 0x03, 0x00, 0x01, 0x14 };
+    static const u8 authDone[] = { 0x06, 0x20, 0x00, 0x02, 0x01, 0x00 };
 
-    if (!outEp)
-        return -1;
+    const u8 *data = NULL;
+    u16 len = 0;
 
-    u8 *out = (u8 *)memalign(32, 32);
-    if (!out)
-        return -1;
+    while (initStage < 4) {
+        switch (initStage) {
+            case 0:
+                data = powerOn;
+                len = sizeof(powerOn);
+                break;
+            case 1:
+                if (activeProfile && activeProfile->pid == XBOX_ONE_S_PID) {
+                    data = oneSInit;
+                    len = sizeof(oneSInit);
+                } else {
+                    initStage++;
+                    continue;
+                }
+                break;
+            case 2:
+                data = ledOn;
+                len = sizeof(ledOn);
+                break;
+            case 3:
+                data = authDone;
+                len = sizeof(authDone);
+                break;
+        }
+        break;
+    }
 
-    memset(out, 0, 32);
-    memcpy(out, powerOn, sizeof(powerOn));
-    s32 rc = USB_WriteIntrMsg(fd, outEp, sizeof(powerOn), out);
-    free(out);
-    return rc;
+    if (!data || !len)
+        return false;
+
+    memset(outputBuffer, 0, sizeof(outputBuffer));
+    memcpy(outputBuffer, data, len);
+    outputBuffer[2] = initSerial;
+    return true;
+}
+
+static void submitCurrentInitPacket(void)
+{
+    if (!active || deviceFd == -1 || !endpointOut || writeInFlight || initStage >= 4)
+        return;
+
+    if (!prepareInitPacket())
+        return;
+
+    s32 rc = USB_WriteIntrMsgAsync(deviceFd, endpointOut,
+                                   (initStage == 2) ? 7 :
+                                   (initStage == 3) ? 6 : 5,
+                                   outputBuffer, writeCallback, NULL);
+    lastWriteSubmitRc = rc;
+
+    if (rc >= 0) {
+        writeInFlight = true;
+    } else {
+        lastWriteCompletionRc = rc;
+        pendingWriteResult = rc;
+        writeResultPending = true;
+    }
+}
+
+static void processInitState(void)
+{
+    if (!active)
+        return;
+
+    if (writeResultPending) {
+        s32 rc = pendingWriteResult;
+        writeResultPending = false;
+
+        if (rc >= 0) {
+            initStage++;
+            initSerial++;
+            initRetries = 0;
+            initRetryCountdown = 1;
+        } else {
+            initRetries++;
+            initRetryCountdown = RETRY_INTERVAL_FRAMES;
+        }
+    }
+
+    if (writeInFlight || initStage >= 4)
+        return;
+
+    if (initRetryCountdown > 0) {
+        initRetryCountdown--;
+        return;
+    }
+
+    submitCurrentInitPacket();
+}
+
+static void processReadRetry(void)
+{
+    if (!active || !readRetryPending || deviceFd == -1)
+        return;
+
+    if (readRetryCountdown > 0) {
+        readRetryCountdown--;
+        return;
+    }
+
+    memset(reportBuffer, 0, sizeof(reportBuffer));
+    s32 rc = USB_ReadIntrMsgAsync(deviceFd, endpointIn, reportLength,
+                                  reportBuffer, readCallback, NULL);
+    lastReadQueueRc = rc;
+
+    if (rc >= 0) {
+        readRetryPending = false;
+    } else if (rc == USB_NAK_RC) {
+        readRetryCountdown = RETRY_INTERVAL_FRAMES;
+    } else {
+        asyncError = rc;
+        closePending = true;
+    }
+}
+
+static void updateStatus(void)
+{
+    if (!active)
+        return;
+
+    snprintf(statusText, sizeof(statusText),
+             "x1s fd:%d q:%d w:%d/%d s:%d n:%u rx:%u c:%02x",
+             lastFd, lastReadQueueRc,
+             lastWriteSubmitRc, (s32)lastWriteCompletionRc,
+             initStage, (unsigned)initRetries,
+             (unsigned)rxPackets, (unsigned)lastRxCommand);
 }
 
 static bool tryOpen(const usb_device_entry *entry)
@@ -272,16 +436,12 @@ static bool tryOpen(const usb_device_entry *entry)
     if (!profile)
         return false;
 
-    lastDeviceId = entry->device_id;
-
     s32 fd = -1;
     s32 rc = USB_OpenDevice(entry->device_id, entry->vid, entry->pid, &fd);
-    lastOpenRc = rc;
     lastFd = fd;
     if (rc < 0) {
-        snprintf(statusText, sizeof(statusText),
-                 "open:%d id:%d %04x:%04x", rc, entry->device_id,
-                 entry->vid, entry->pid);
+        snprintf(statusText, sizeof(statusText), "open:%d %04x:%04x",
+                 rc, entry->vid, entry->pid);
         return false;
     }
 
@@ -295,7 +455,6 @@ static bool tryOpen(const usb_device_entry *entry)
     } else {
         usb_devdesc *dd = (usb_devdesc *)memalign(32, sizeof(usb_devdesc));
         if (!dd) {
-            snprintf(statusText, sizeof(statusText), "alloc desc failed");
             USB_CloseDevice(&fd);
             return false;
         }
@@ -315,26 +474,9 @@ static bool tryOpen(const usb_device_entry *entry)
         free(dd);
 
         if (!endpointsOk || !inEp || !outEp) {
-            snprintf(statusText, sizeof(statusText), "no endpoints %04x:%04x",
-                     entry->vid, entry->pid);
             USB_CloseDevice(&fd);
             return false;
         }
-    }
-
-    /* Single resume probe; unlike V16-V18 there are no halt clears, retries,
-     * filesystem writes or reordered platform initialization. */
-    lastResumeRc = USB_ResumeDevice(fd);
-
-    rc = initializeXboxOne(fd, outEp);
-    lastWriteRc = rc;
-    if (rc < 0) {
-        snprintf(statusText, sizeof(statusText),
-                 "%s fd:%d r:%d w:%d ep:%02x/%02x",
-                 directPath ? "direct" : "desc", fd,
-                 lastResumeRc, lastWriteRc, inEp, outEp);
-        USB_CloseDevice(&fd);
-        return false;
     }
 
     deviceFd = fd;
@@ -347,25 +489,43 @@ static bool tryOpen(const usb_device_entry *entry)
     asyncError = 0;
     closePending = false;
     active = true;
-    memset(reportBuffer, 0, sizeof(reportBuffer));
 
+    lastReadQueueRc = 999;
+    lastReadCallbackRc = 999;
+    lastWriteSubmitRc = 999;
+    lastWriteCompletionRc = 999;
+    rxPackets = 0;
+    lastRxCommand = 0;
+    initRetries = 0;
+    initStage = 0;
+    initSerial = 0;
+    initRetryCountdown = 0;
+    writeInFlight = false;
+    writeResultPending = false;
+    readRetryPending = false;
+    readRetryCountdown = 0;
+
+    /* Linux xpad starts interrupt IN before beginning Xbox One GIP init. */
+    memset(reportBuffer, 0, sizeof(reportBuffer));
     rc = USB_ReadIntrMsgAsync(deviceFd, endpointIn, reportLength,
                               reportBuffer, readCallback, NULL);
     lastReadQueueRc = rc;
     if (rc < 0) {
-        snprintf(statusText, sizeof(statusText),
-                 "%s fd:%d r:%d w:%d q:%d ep:%02x/%02x",
-                 directPath ? "direct" : "desc", fd,
-                 lastResumeRc, lastWriteRc, lastReadQueueRc,
-                 endpointIn, endpointOut);
-        closeController();
-        return false;
+        if (rc == USB_NAK_RC) {
+            readRetryPending = true;
+            readRetryCountdown = RETRY_INTERVAL_FRAMES;
+        } else {
+            snprintf(statusText, sizeof(statusText),
+                     "readq:%d fd:%d ep:%02x/%02x",
+                     rc, fd, endpointIn, endpointOut);
+            closeController();
+            return false;
+        }
     }
 
-    snprintf(statusText, sizeof(statusText),
-             "connected fd:%d r:%d w:%d q:%d ep:%02x/%02x",
-             fd, lastResumeRc, lastWriteRc, lastReadQueueRc,
-             endpointIn, endpointOut);
+    /* Do not fail/close on output NAK. Keep IN alive and retry slowly. */
+    submitCurrentInitPacket();
+    updateStatus();
     return true;
 }
 
@@ -418,13 +578,6 @@ static void initializeDriver(void)
     closePending = false;
     asyncError = 0;
 
-    lastDeviceId = 0;
-    lastFd = -1;
-    lastOpenRc = 0;
-    lastResumeRc = 0;
-    lastWriteRc = 0;
-    lastReadQueueRc = 0;
-
     s32 rc = USB_Initialize();
     if (rc < 0) {
         snprintf(statusText, sizeof(statusText), "USB init:%d", rc);
@@ -443,13 +596,18 @@ void XBOXONE_ScanPads(void)
         s32 err = asyncError;
         closeController();
         snprintf(statusText, sizeof(statusText),
-                 "readcb:%d fd:%d r:%d w:%d q:%d",
-                 err, lastFd, lastResumeRc, lastWriteRc, lastReadQueueRc);
+                 "usbcb:%d fd:%d q:%d w:%d/%d",
+                 err, lastFd, lastReadQueueRc,
+                 lastWriteSubmitRc, (s32)lastWriteCompletionRc);
         pollCountdown = 0;
     }
 
-    if (active)
+    if (active) {
+        processReadRetry();
+        processInitState();
+        updateStatus();
         return;
+    }
 
     if (--pollCountdown > 0)
         return;
@@ -473,6 +631,7 @@ char *XBOXONE_Status(void)
 {
     if (!initialized)
         initializeDriver();
+    updateStatus();
     return statusText;
 }
 
