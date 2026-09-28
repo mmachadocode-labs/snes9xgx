@@ -8,12 +8,11 @@
 
 #define MS_VID 0x045e
 #define GIP_CLASS 0xff
-#define GIP_SUBCLASS 0x47
-#define GIP_PROTOCOL 0xd0
 #define MAX_USB_DEVICES 32
 #define BUF_SIZE 64
 #define STICK_THRESHOLD 16384
 #define TRIGGER_THRESHOLD 512
+#define USB_NAK -7005
 
 #define GIP_CMD_VIRTUAL_KEY 0x07
 #define GIP_CMD_INPUT       0x20
@@ -67,78 +66,6 @@ static u16 u16le(const u8 *p)
     return (u16)p[0] | ((u16)p[1] << 8);
 }
 
-static bool findDataEndpoints(usb_devdesc *desc, u8 *configuration)
-{
-    bool fallbackFound = false;
-    u8 fallbackIn = 0;
-    u8 fallbackOut = 0;
-    u16 fallbackSize = BUF_SIZE;
-    u8 fallbackConfig = 1;
-
-    if (!desc || !desc->configurations)
-        return false;
-
-    for (u8 c = 0; c < desc->bNumConfigurations; ++c) {
-        usb_configurationdesc *cfg = &desc->configurations[c];
-        if (!cfg->interfaces)
-            continue;
-
-        for (u8 i = 0; i < cfg->bNumInterfaces; ++i) {
-            usb_interfacedesc *intf = &cfg->interfaces[i];
-            if (!intf->endpoints)
-                continue;
-
-            u8 localIn = 0;
-            u8 localOut = 0;
-            u16 localSize = BUF_SIZE;
-
-            for (u8 e = 0; e < intf->bNumEndpoints; ++e) {
-                usb_endpointdesc *ep = &intf->endpoints[e];
-                if ((ep->bmAttributes & 0x03) != USB_ENDPOINT_INTERRUPT)
-                    continue;
-
-                if ((ep->bEndpointAddress & 0x80) == USB_ENDPOINT_IN) {
-                    localIn = ep->bEndpointAddress;
-                    if (ep->wMaxPacketSize > 0 && ep->wMaxPacketSize <= BUF_SIZE)
-                        localSize = ep->wMaxPacketSize;
-                } else {
-                    localOut = ep->bEndpointAddress;
-                }
-            }
-
-            if (localIn && localOut) {
-                if (!fallbackFound) {
-                    fallbackFound = true;
-                    fallbackIn = localIn;
-                    fallbackOut = localOut;
-                    fallbackSize = localSize;
-                    fallbackConfig = cfg->bConfigurationValue;
-                }
-
-                if (intf->bInterfaceClass == GIP_CLASS &&
-                    intf->bInterfaceSubClass == GIP_SUBCLASS &&
-                    intf->bInterfaceProtocol == GIP_PROTOCOL) {
-                    epIn = localIn;
-                    epOut = localOut;
-                    packetSize = localSize;
-                    *configuration = cfg->bConfigurationValue;
-                    return true;
-                }
-            }
-        }
-    }
-
-    if (fallbackFound) {
-        epIn = fallbackIn;
-        epOut = fallbackOut;
-        packetSize = fallbackSize;
-        *configuration = fallbackConfig;
-        return true;
-    }
-
-    return false;
-}
-
 static int sendPacket(const u8 *packet, u8 len)
 {
     u8 ATTRIBUTE_ALIGN(32) out[32];
@@ -147,12 +74,31 @@ static int sendPacket(const u8 *packet, u8 len)
 
     memset(out, 0, sizeof(out));
     memcpy(out, packet, len);
-    out[2] = sequence++;
-    return USB_WriteIntrMsg(deviceId, epOut, len, out);
+    out[2] = sequence;
+
+    int rc = USB_WriteIntrMsg(deviceId, epOut, len, out);
+    if (rc >= 0)
+        sequence++;
+    return rc;
 }
 
-/* Match the Linux xpad startup sequence: generic 2015+ power-on, then the
- * extra Xbox One S packet for 045e:02ea / Elite 2. */
+static int sendPacketRetry(const u8 *packet, u8 len)
+{
+    int rc = -1;
+    for (int attempt = 0; attempt < 40; ++attempt) {
+        rc = sendPacket(packet, len);
+        if (rc >= 0)
+            return rc;
+        if (rc != USB_NAK)
+            return rc;
+        usleep(25000);
+    }
+    return rc;
+}
+
+/* Linux xpad order for Xbox One S: normal power-on first, then the
+ * model-specific packet used by 045e:02ea. IOS58 may expose NAK while the
+ * device is waking, so retry the same packet/sequence rather than advancing. */
 static int initializeController(int *secondResult)
 {
     static const u8 powerOn[] = {
@@ -163,13 +109,12 @@ static int initializeController(int *secondResult)
     };
 
     sequence = 0;
-    int first = sendPacket(powerOn, sizeof(powerOn));
+    int first = sendPacketRetry(powerOn, sizeof(powerOn));
     int second = 0;
-    usleep(2000);
 
     if (first >= 0 && active && active->needsSInit) {
-        second = sendPacket(oneSInit, sizeof(oneSInit));
-        usleep(2000);
+        usleep(25000);
+        second = sendPacketRetry(oneSInit, sizeof(oneSInit));
     }
 
     if (secondResult)
@@ -196,10 +141,10 @@ static void parseInput(int len)
 
     held |= (inBuf[4] & 0x04) ? PAD_BUTTON_START : 0;
     held |= (inBuf[4] & 0x08) ? PAD_TRIGGER_Z : 0;
-    held |= (inBuf[4] & 0x10) ? PAD_BUTTON_B : 0; /* Xbox A -> SNES B */
-    held |= (inBuf[4] & 0x20) ? PAD_BUTTON_A : 0; /* Xbox B -> SNES A */
-    held |= (inBuf[4] & 0x40) ? PAD_BUTTON_Y : 0; /* Xbox X -> SNES Y */
-    held |= (inBuf[4] & 0x80) ? PAD_BUTTON_X : 0; /* Xbox Y -> SNES X */
+    held |= (inBuf[4] & 0x10) ? PAD_BUTTON_B : 0;
+    held |= (inBuf[4] & 0x20) ? PAD_BUTTON_A : 0;
+    held |= (inBuf[4] & 0x40) ? PAD_BUTTON_Y : 0;
+    held |= (inBuf[4] & 0x80) ? PAD_BUTTON_X : 0;
 
     held |= (inBuf[5] & 0x01) ? PAD_BUTTON_UP : 0;
     held |= (inBuf[5] & 0x02) ? PAD_BUTTON_DOWN : 0;
@@ -227,7 +172,7 @@ static void parseInput(int len)
     held |= (rx < -STICK_THRESHOLD) ? PAD_BUTTON_LEFT : 0;
     held |= (rx > STICK_THRESHOLD) ? PAD_BUTTON_RIGHT : 0;
 
-    snprintf(statusText, sizeof(statusText), "connected input:%d", len);
+    snprintf(statusText, sizeof(statusText), "INPUT len:%d held:%08lx", len, (unsigned long)held);
 }
 
 static int readCallback(int result, void *userdata)
@@ -239,6 +184,9 @@ static int readCallback(int result, void *userdata)
         parseInput(result);
     else if (result < 0)
         snprintf(statusText, sizeof(statusText), "read cb:%d", result);
+
+    if (result == USB_NAK)
+        usleep(5000);
 
     int rc = USB_ReadIntrMsgAsync(deviceId, epIn, packetSize, inBuf, &readCallback, NULL);
     if (rc < 0) {
@@ -298,70 +246,54 @@ static void openController(void)
             continue;
         }
 
-        bool descriptorOk = false;
+        /* USB_OpenDevice already requests resume, but IOS58 does not wait for
+         * the physical pad to become ready. Explicitly resume and give the
+         * Xbox One S time to leave suspend before touching endpoint 0x02. */
+        s32 resumeResult = USB_ResumeDevice(fd);
+        usleep(250000);
+
         usb_devdesc desc;
         s32 descResult = USB_GetDescriptors(fd, &desc);
-        u8 config = 1;
-
-        if (descResult >= 0) {
-            descriptorOk = findDataEndpoints(&desc, &config);
+        if (descResult >= 0)
             USB_FreeDescriptors(&desc);
-        }
 
-        if (!descriptorOk) {
-            /* Official 045e:02ea interface 0 uses interrupt OUT 0x02 and
-             * interrupt IN 0x82, both 64-byte packets. IOS58 can enumerate
-             * the device while GETDEVPARAMS still returns IPC_EINVAL (-4),
-             * so use the known GIP endpoints as a fallback. */
-            epIn = 0x82;
-            epOut = 0x02;
-            packetSize = BUF_SIZE;
-            config = 1;
-        }
-
-        /* The controller is normally already configured by IOS58. Keep these
-         * calls only as diagnostics; a NAK here is not fatal. */
-        s32 configResult = USB_SetConfiguration(fd, config);
-        s32 altResult = USB_SetAlternativeInterface(fd, 0, 0);
+        /* 045e:02ea interface 0 is FF/47/D0 with interrupt OUT 0x02 and
+         * interrupt IN 0x82, 64 bytes. Do not SET_CONFIGURATION/INTERFACE:
+         * IOS58 already owns/configures the VEN interface and those requests
+         * were returning NAK on the real Wii. */
+        epIn = 0x82;
+        epOut = 0x02;
+        packetSize = BUF_SIZE;
 
         deviceId = fd;
         active = candidate;
         held = 0;
-        reading = false;
+        reading = true;
+
+        /* Arm input first. Linux keeps an input URB active while the startup
+         * packets are sent; doing the same also tells us whether IN works even
+         * when the first OUT transfer is NAKed. */
+        int queueResult = USB_ReadIntrMsgAsync(deviceId, epIn, packetSize, inBuf, &readCallback, NULL);
+        if (queueResult < 0)
+            reading = false;
 
         int secondWrite = 0;
         int firstWrite = initializeController(&secondWrite);
-        if (firstWrite < 0 || secondWrite < 0) {
-            snprintf(lastDiag, sizeof(lastDiag),
-                     "i%u id:%d ep:%02x/%02x d:%d c:%d a:%d w:%d/%d",
-                     i, devices[i].device_id, epIn, epOut, descResult,
-                     configResult, altResult, firstWrite, secondWrite);
-            deviceId = 0;
-            active = NULL;
-            USB_CloseDevice(&fd);
-            continue;
+
+        if (queueResult >= 0) {
+            USB_DeviceRemovalNotifyAsync(fd, &removalCallback, (void *)fd);
+            snprintf(statusText, sizeof(statusText),
+                     "OPEN i%u r:%d d:%d q:%d w:%d/%d",
+                     i, resumeResult, descResult, queueResult, firstWrite, secondWrite);
+            return;
         }
 
-        reading = true;
-        int queueResult = USB_ReadIntrMsgAsync(deviceId, epIn, packetSize, inBuf, &readCallback, NULL);
-        if (queueResult < 0) {
-            snprintf(lastDiag, sizeof(lastDiag),
-                     "i%u id:%d ep:%02x/%02x d:%d c:%d a:%d w:%d/%d q:%d",
-                     i, devices[i].device_id, epIn, epOut, descResult,
-                     configResult, altResult, firstWrite, secondWrite, queueResult);
-            reading = false;
-            deviceId = 0;
-            active = NULL;
-            USB_CloseDevice(&fd);
-            continue;
-        }
-
-        USB_DeviceRemovalNotifyAsync(fd, &removalCallback, (void *)fd);
-        snprintf(statusText, sizeof(statusText),
-                 "OK i%u ep:%02x/%02x d:%d c:%d a:%d w:%d/%d q:%d",
-                 i, epIn, epOut, descResult,
-                 configResult, altResult, firstWrite, secondWrite, queueResult);
-        return;
+        snprintf(lastDiag, sizeof(lastDiag),
+                 "i%u r:%d d:%d q:%d w:%d/%d",
+                 i, resumeResult, descResult, queueResult, firstWrite, secondWrite);
+        deviceId = 0;
+        active = NULL;
+        USB_CloseDevice(&fd);
     }
 
     if (sawSupported)
