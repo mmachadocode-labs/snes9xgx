@@ -10,7 +10,7 @@
  *
  * Lifecycle used here:
  *   Open handle -> async GetDeviceChange -> Attach matching interface
- *   -> AttachFinish -> Resume -> GetDeviceInfo -> queue interrupt IN
+ *   -> Resume -> GetDeviceInfo -> AttachFinish -> queue interrupt IN
  *   -> send Xbox GIP init.
  *
  * Xbox One S 045e:02ea uses interface FF/47/D0. Init packets and sequencing
@@ -467,8 +467,9 @@ static bool connectFromReadyList(void)
     lastRxCommand = 0;
     outSequence = 1;
 
-    /* GetDeviceChange has locked the manager to this handle. Claim the target
-     * while that lock is held, then immediately unlock other VEN handles. */
+    /* GetDeviceChange owns the manager lock for this handle. The ownership
+     * sequence used by working USBv5 controller backends is:
+     * Attach -> Resume -> GetDeviceInfo -> AttachFinish. */
     setCmdDevice(deviceId);
     rcAttach = IOS_Ioctl(venFd, VEN_IOCTL_ATTACH,
                          cmdBuffer, 0x20, NULL, 0);
@@ -481,24 +482,46 @@ static bool connectFromReadyList(void)
     }
     deviceOwned = true;
 
-    rcAttachFinish = IOS_Ioctl(venFd, VEN_IOCTL_ATTACHFINISH,
-                               NULL, 0, NULL, 0);
-
     setCmdDevice(deviceId);
     ((s32 *)cmdBuffer)[2] = 1; /* state byte 11 on big-endian PPC */
     rcResume = IOS_Ioctl(venFd, VEN_IOCTL_SUSPEND_RESUME,
                          cmdBuffer, 0x20, NULL, 0);
+    if (rcResume < 0) {
+        releaseCurrentDevice();
+        rcAttachFinish = IOS_Ioctl(venFd, VEN_IOCTL_ATTACHFINISH,
+                                   NULL, 0, NULL, 0);
+        armDeviceChange();
+        snprintf(statusText, sizeof(statusText),
+                 "not found VEN a:%d r:%d f:%d",
+                 rcAttach, rcResume, rcAttachFinish);
+        return false;
+    }
 
     setCmdDevice(deviceId);
     memset(deviceInfo, 0, 0xc0);
     rcDeviceInfo = IOS_Ioctl(venFd, VEN_IOCTL_GETDEVPARAMS,
                              cmdBuffer, 0x20, deviceInfo, 0xc0);
-    if (rcDeviceInfo < 0 || !parseGipInterface()) {
-        snprintf(statusText, sizeof(statusText),
-                 "not found VEN a:%d f:%d r:%d d:%d",
-                 rcAttach, rcAttachFinish, rcResume, rcDeviceInfo);
+    bool gipOk = (rcDeviceInfo >= 0) && parseGipInterface();
+    if (!gipOk) {
         releaseCurrentDevice();
+        rcAttachFinish = IOS_Ioctl(venFd, VEN_IOCTL_ATTACHFINISH,
+                                   NULL, 0, NULL, 0);
         armDeviceChange();
+        snprintf(statusText, sizeof(statusText),
+                 "not found VEN a:%d r:%d d:%d g:%d f:%d",
+                 rcAttach, rcResume, rcDeviceInfo, gipOk ? 1 : 0,
+                 rcAttachFinish);
+        return false;
+    }
+
+    rcAttachFinish = IOS_Ioctl(venFd, VEN_IOCTL_ATTACHFINISH,
+                               NULL, 0, NULL, 0);
+    if (rcAttachFinish < 0) {
+        releaseCurrentDevice();
+        closeVenHandle();
+        snprintf(statusText, sizeof(statusText),
+                 "not found VEN a:%d r:%d d:%d g:1 f:%d",
+                 rcAttach, rcResume, rcDeviceInfo, rcAttachFinish);
         return false;
     }
 
@@ -523,8 +546,8 @@ static bool connectFromReadyList(void)
 
     if (rcPower < 0 || rcSpecial < 0) {
         snprintf(statusText, sizeof(statusText),
-                 "not found VEN a:%d r:%d d:%d q:%d p:%d/%d",
-                 rcAttach, rcResume, rcDeviceInfo,
+                 "not found VEN a:%d r:%d d:%d f:%d q:%d p:%d/%d",
+                 rcAttach, rcResume, rcDeviceInfo, rcAttachFinish,
                  rcReadSubmit, rcPower, rcSpecial);
         /* Keep the owned interface and pending IN alive for diagnostics. */
         return false;
