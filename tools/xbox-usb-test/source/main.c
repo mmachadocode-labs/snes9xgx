@@ -16,6 +16,10 @@
 #define MAX_DEVS   32
 #define USB_NAK_RC (-7005)
 
+#define ATTACH_WAIT_FRAMES 120
+#define RESUME_RETRY_FRAMES 30
+#define RESUME_MAX_ATTEMPTS 10
+
 #define WRITE_NONE    0
 #define WRITE_POWER   1
 #define WRITE_SPECIAL 2
@@ -29,6 +33,9 @@ static u8 lastPacket[PKT_SIZE] ATTRIBUTE_ALIGN(32);
 static s32 usbInitRc = 999;
 static s32 listRc = 999;
 static u8 deviceCount = 0;
+static s32 interfaceDeviceId[3] = { -1, -1, -1 };
+static u32 interfaceToken[3] = { 0, 0, 0 };
+static s32 resumeProbe[3] = { 999, 999, 999 };
 static s32 targetDeviceId = -1;
 static u32 targetToken = 0;
 static s32 openRc = 999;
@@ -36,7 +43,12 @@ static s32 resumeRc = 999;
 static s32 removeHookRc = 999;
 static s32 usbFd = -1;
 static bool opened = false;
+static bool ownershipReady = false;
+static bool ownershipFailed = false;
 static volatile bool removed = false;
+static u32 firstSeenFrame = 0;
+static u32 nextResumeFrame = 0;
+static int resumeAttempts = 0;
 
 static volatile bool readInFlight = false;
 static volatile bool readDone = false;
@@ -170,6 +182,26 @@ static void resetTransportState(void)
     resetInputState();
 }
 
+static void resetOwnershipState(void)
+{
+    targetDeviceId = -1;
+    targetToken = 0;
+    for (int i = 0; i < 3; ++i) {
+        interfaceDeviceId[i] = -1;
+        interfaceToken[i] = 0;
+        resumeProbe[i] = 999;
+    }
+    firstSeenFrame = 0;
+    nextResumeFrame = 0;
+    resumeAttempts = 0;
+    openRc = 999;
+    resumeRc = 999;
+    removeHookRc = 999;
+    opened = false;
+    ownershipReady = false;
+    ownershipFailed = false;
+}
+
 static void disconnectController(void)
 {
     if (usbFd != -1) {
@@ -178,19 +210,14 @@ static void disconnectController(void)
     }
 
     usbFd = -1;
-    opened = false;
     removed = false;
-    targetDeviceId = -1;
-    targetToken = 0;
-    openRc = 999;
-    resumeRc = 999;
-    removeHookRc = 999;
     resetTransportState();
+    resetOwnershipState();
 }
 
 static s32 submitWrite(int kind, const u8 *packet, u16 len, int seqOverride)
 {
-    if (!opened || usbFd == -1 || writeInFlight || !packet || len == 0 || len > PKT_SIZE)
+    if (!ownershipReady || usbFd == -1 || writeInFlight || !packet || len == 0 || len > PKT_SIZE)
         return -4;
 
     memset(outBuf, 0, sizeof(outBuf));
@@ -256,7 +283,7 @@ static void startScheduledWrite(void)
 
 static s32 queueRead(void)
 {
-    if (!opened || usbFd == -1 || readInFlight)
+    if (!ownershipReady || usbFd == -1 || readInFlight)
         return -4;
 
     memset(inBuf, 0, sizeof(inBuf));
@@ -377,7 +404,7 @@ static void processWrite(void)
     startScheduledWrite();
 }
 
-static void enumerateAndOpen(void)
+static void refreshDeviceList(void)
 {
     memset(devices, 0, sizeof(devices));
     deviceCount = 0;
@@ -385,36 +412,84 @@ static void enumerateAndOpen(void)
     if (listRc < 0)
         return;
 
-    targetDeviceId = -1;
-    targetToken = 0;
+    s32 newIds[3] = { -1, -1, -1 };
+    u32 newTokens[3] = { 0, 0, 0 };
+
     for (u8 i = 0; i < deviceCount; ++i) {
-        if (devices[i].vid == TARGET_VID && devices[i].pid == TARGET_PID &&
-            interfaceNumber(&devices[i]) == TARGET_IF) {
-            targetDeviceId = devices[i].device_id;
-            targetToken = devices[i].token;
-            break;
+        if (devices[i].vid == TARGET_VID && devices[i].pid == TARGET_PID) {
+            u8 ifnum = interfaceNumber(&devices[i]);
+            if (ifnum < 3) {
+                newIds[ifnum] = devices[i].device_id;
+                newTokens[ifnum] = devices[i].token;
+            }
         }
     }
 
-    if (targetDeviceId == -1)
+    if (!ownershipReady && !opened) {
+        if (targetDeviceId != newIds[TARGET_IF]) {
+            resetOwnershipState();
+            firstSeenFrame = frameCounter;
+        }
+
+        for (int i = 0; i < 3; ++i) {
+            interfaceDeviceId[i] = newIds[i];
+            interfaceToken[i] = newTokens[i];
+        }
+        targetDeviceId = newIds[TARGET_IF];
+        targetToken = newTokens[TARGET_IF];
+
+        if (targetDeviceId != -1 && firstSeenFrame == 0)
+            firstSeenFrame = frameCounter;
+    }
+}
+
+static void beginOwnershipProbe(void)
+{
+    if (targetDeviceId == -1 || ownershipReady || ownershipFailed)
         return;
 
-    s32 candidateFd = -1;
-    openRc = USB_OpenDevice(targetDeviceId, TARGET_VID, TARGET_PID, &candidateFd);
-    if (openRc < 0)
+    if (!opened) {
+        if ((frameCounter - firstSeenFrame) < ATTACH_WAIT_FRAMES)
+            return;
+
+        s32 candidateFd = -1;
+        openRc = USB_OpenDevice(targetDeviceId, TARGET_VID, TARGET_PID, &candidateFd);
+        if (openRc < 0)
+            return;
+
+        usbFd = candidateFd;
+        opened = true;
+        nextResumeFrame = frameCounter;
+    }
+
+    if (frameCounter < nextResumeFrame)
         return;
 
-    usbFd = candidateFd;
-    opened = true;
-    removed = false;
-    resetTransportState();
+    resumeAttempts++;
+    for (int i = 0; i < 3; ++i) {
+        if (interfaceDeviceId[i] != -1)
+            resumeProbe[i] = USB_ResumeDevice(interfaceDeviceId[i]);
+    }
 
-    /* USB_OpenDevice already asks libogc2 to resume the V5 device. Repeat the
-       public API call only as a diagnostic; continue even if IOS58 returns -4. */
     resumeRc = USB_ResumeDevice(usbFd);
-    removeHookRc = USB_DeviceRemovalNotifyAsync(usbFd, removalCallback, NULL);
 
-    scheduleWrite(WRITE_POWER, 2, true);
+    bool anyResumeOk = (resumeRc == 0);
+    for (int i = 0; i < 3; ++i)
+        anyResumeOk = anyResumeOk || (resumeProbe[i] == 0);
+
+    if (anyResumeOk) {
+        ownershipReady = true;
+        removeHookRc = USB_DeviceRemovalNotifyAsync(usbFd, removalCallback, NULL);
+        scheduleWrite(WRITE_POWER, 4, true);
+        return;
+    }
+
+    if (resumeAttempts >= RESUME_MAX_ATTEMPTS) {
+        ownershipFailed = true;
+        return;
+    }
+
+    nextResumeFrame = frameCounter + RESUME_RETRY_FRAMES;
 }
 
 static void appendButton(char *dst, size_t size, const char *name)
@@ -455,8 +530,14 @@ static void buildButtonString(char *dst, size_t size)
 
 static const char *stageName(void)
 {
+    if (targetDeviceId == -1)
+        return "ENUMERATING";
     if (!opened)
-        return targetDeviceId == -1 ? "ENUMERATING" : "OPEN FAILED";
+        return "WAITING FOR LIBOGC ATTACHFINISH";
+    if (ownershipFailed)
+        return "IOS58 OWNERSHIP FAILED";
+    if (!ownershipReady)
+        return "PROBING RESUME ON ALL 3 INTERFACES";
     if (!readingEnabled)
         return "GIP INIT";
     if (rxPackets == 0)
@@ -472,28 +553,30 @@ static void render(void)
     buildButtonString(buttons, sizeof(buttons));
 
     printf("\x1b[2J\x1b[H");
-    printf("XBOX ONE S USB INPUT TEST - Wii / libogc2\n");
+    printf("XBOX ONE S USB INPUT TEST v1.1 - Wii / libogc2\n");
     printf("Target 045e:02ea  IF:0  GIP ff/47/d0  IN:82 OUT:02\n");
     printf("HOME: exit\n\n");
 
     printf("Stage: %s\n", stageName());
-    printf("USB_Initialize: %ld   USB_GetDeviceList: %ld   count:%u\n",
+    printf("USB_Initialize:%ld  GetDeviceList:%ld  count:%u\n",
            (long)usbInitRc, (long)listRc, (unsigned)deviceCount);
 
-    for (u8 i = 0; i < deviceCount && i < 6; ++i) {
-        if (devices[i].vid == TARGET_VID && devices[i].pid == TARGET_PID) {
-            printf(" %c%u dev:%ld  %04x:%04x token:%08lx if:%u\n",
-                   interfaceNumber(&devices[i]) == TARGET_IF ? '>' : ' ',
-                   (unsigned)i, (long)devices[i].device_id,
-                   devices[i].vid, devices[i].pid,
-                   (unsigned long)devices[i].token,
-                   (unsigned)interfaceNumber(&devices[i]));
+    for (int i = 2; i >= 0; --i) {
+        if (interfaceDeviceId[i] != -1) {
+            printf(" if:%d dev:%ld token:%08lx resume:%ld%s\n",
+                   i, (long)interfaceDeviceId[i],
+                   (unsigned long)interfaceToken[i],
+                   (long)resumeProbe[i], i == TARGET_IF ? "  <GIP>" : "");
         }
     }
 
-    printf("\nSelected dev:%ld token:%08lx\n",
+    u32 waited = targetDeviceId == -1 ? 0 : frameCounter - firstSeenFrame;
+    printf("\nWait:%lu/%d frames  resume attempts:%d/%d\n",
+           (unsigned long)waited, ATTACH_WAIT_FRAMES,
+           resumeAttempts, RESUME_MAX_ATTEMPTS);
+    printf("Selected dev:%ld token:%08lx\n",
            (long)targetDeviceId, (unsigned long)targetToken);
-    printf("Open:%ld fd:%ld  Resume:%ld  removal-hook:%ld\n",
+    printf("Open:%ld fd:%ld  Resume(fd):%ld  removal-hook:%ld\n",
            (long)openRc, (long)usbFd, (long)resumeRc, (long)removeHookRc);
     printf("Power  submit:%ld done:%ld  Special submit:%ld done:%ld\n",
            (long)powerSubmitRc, (long)powerDoneRc,
@@ -519,10 +602,12 @@ static void render(void)
         printf(" %02x", lastPacket[i]);
     printf("\n");
 
-    if (opened && readingEnabled && rxPackets == 0)
-        printf("\nPress buttons/move sticks. RX should start increasing.\n");
-    if (rxPackets > 0)
-        printf("\nUSB input is arriving. This is the data to port into Snes9x GX.\n");
+    if (ownershipFailed)
+        printf("\nAll delayed Resume probes stayed negative. Photograph this screen.\n");
+    else if (ownershipReady && rxPackets == 0)
+        printf("\nOwnership passed. Press buttons/move sticks; RX should increase.\n");
+    else if (rxPackets > 0)
+        printf("\nUSB input is arriving. This path can be ported to Snes9x GX.\n");
 }
 
 int main(int argc, char **argv)
@@ -546,23 +631,26 @@ int main(int argc, char **argv)
     if (rmode->viTVMode & VI_NON_INTERLACE)
         VIDEO_WaitVSync();
 
+    resetTransportState();
+    resetOwnershipState();
     usbInitRc = USB_Initialize();
-    if (usbInitRc >= 0)
-        enumerateAndOpen();
 
     while (1) {
         WPAD_ScanPads();
         if (WPAD_ButtonsDown(0) & WPAD_BUTTON_HOME)
             break;
 
-        if (removed) {
+        if (removed)
             disconnectController();
-        }
 
-        if (usbInitRc >= 0 && !opened && (frameCounter % 60) == 0)
-            enumerateAndOpen();
+        if (usbInitRc >= 0 && !ownershipReady && !ownershipFailed &&
+            (frameCounter % 15) == 0)
+            refreshDeviceList();
 
-        if (opened) {
+        if (usbInitRc >= 0)
+            beginOwnershipProbe();
+
+        if (ownershipReady) {
             processWrite();
             processRead();
         }
