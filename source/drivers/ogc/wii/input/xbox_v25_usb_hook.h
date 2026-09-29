@@ -2,185 +2,240 @@
 #define SNES9XGX_XBOX_V25_USB_HOOK_H
 
 /*
- * V27 broad IOS58 /dev/usb/ven probe for Xbox One S (045e:02ea).
+ * V28: direct IOS58 /dev/usb/ven lifecycle probe for Xbox One S 045e:02ea.
  *
- * One Wii run now checks the selected handle, SetConfiguration(1), and all
- * matching IOS58 interface entries. The normal driver still owns the real
- * async input path; this shim only records which setup/OUT operations work.
+ * V27 proved that libogc2 can list and "open" all three VEN interface entries,
+ * but GetDeviceInfo/control operations and every interrupt OUT still fail.
+ * WiiBrew documents an explicit VEN Attach (ioctl 4) step before Resume,
+ * GetDeviceInfo and transfers. libogc2's V5 USB_OpenDevice path does not issue
+ * Attach, and also ignores the result of USB_ResumeDevice().
  *
- * q: in Credits is replaced with 27000 + a 16-bit success mask.
+ * This probe opens a second VEN handle, obtains its own device list, explicitly
+ * attaches interface 0, resumes it, gets device parameters, then submits the
+ * two Xbox One S GIP init packets directly through VEN ioctlv 0x13. This avoids
+ * libogc2's high-level V5 lifecycle while retaining the normal driver for the
+ * rest of the emulator.
+ *
+ * q: in Credits is replaced with 28000 + success mask.
  */
 
 #include <ogc/usb.h>
 #include <ogc/system.h>
 #include <ogc/timesupp.h>
+#include <ipc.h>
 #include <stdbool.h>
 #include <string.h>
 
-#define XBOX_V27_VID 0x045e
-#define XBOX_V27_PID 0x02ea
-#define XBOX_V27_IN_EP  0x82
-#define XBOX_V27_OUT_EP 0x02
-#define XBOX_V27_MAX_DEVICES 32
+#define XBOX_V28_VID 0x045e
+#define XBOX_V28_PID 0x02ea
+#define XBOX_V28_IN_EP  0x82
+#define XBOX_V28_OUT_EP 0x02
 
-/* q = 27000 + mask
- * 0x0001 selected: USB_GetDescriptors succeeded
- * 0x0002 selected: aligned USB_GetConfiguration succeeded
- * 0x0004 selected: USB_SetConfiguration(1) succeeded
- * 0x0008 selected: aligned GetConfiguration after SetConfiguration succeeded
- * 0x0010 selected: power-on OUT after SetConfiguration succeeded
- * 0x0020 selected: One-S init OUT after SetConfiguration succeeded
- * 0x0040 selected: USB_SetAlternativeInterface(0,0) succeeded
- * 0x0080 selected: power-on OUT after SetAlternativeInterface succeeded
- * 0x0100 USB_GetDeviceList succeeded
- * 0x0200 entry 0: USB_OpenDevice succeeded
- * 0x0400 entry 0: power-on OUT succeeded
- * 0x0800 entry 1: USB_OpenDevice succeeded
- * 0x1000 entry 1: power-on OUT succeeded
- * 0x2000 entry 2: USB_OpenDevice succeeded
- * 0x4000 entry 2: power-on OUT succeeded
- * 0x8000 probe MEM2/aligned buffer allocation succeeded
+#define V28_IOCTL_GETVERSION       0
+#define V28_IOCTL_GETDEVICECHANGE  1
+#define V28_IOCTL_GETDEVPARAMS     3
+#define V28_IOCTL_ATTACH           4
+#define V28_IOCTL_RELEASE          5
+#define V28_IOCTL_ATTACHFINISH     6
+#define V28_IOCTL_SUSPEND_RESUME  16
+#define V28_IOCTL_INTRMSG         19
+
+/* q = 28000 + mask
+ * 0x0001 IOS_Open(/dev/usb/ven, handle 1) succeeded
+ * 0x0002 GetVersion returned 0x50001
+ * 0x0004 GetDeviceChange succeeded
+ * 0x0008 found 045e:02ea interface 0 on our handle
+ * 0x0010 Attach(interface 0) succeeded
+ * 0x0020 Resume succeeded
+ * 0x0040 GetDeviceInfo succeeded
+ * 0x0080 direct power-on interrupt OUT succeeded
+ * 0x0100 direct One-S init interrupt OUT succeeded
+ * 0x0200 AttachFinish succeeded
+ * 0x0400 power-on OUT after AttachFinish succeeded
+ * 0x0800 Release succeeded
+ * 0x1000 normal libogc2 USB_GetDeviceList succeeded (sanity)
+ * 0x2000 direct probe MEM2 allocation succeeded
  */
-static s32 xboxV27Fd = -1;
-static bool xboxV27ProbeRan = false;
-static u32 xboxV27Mask = 0;
+static s32 xboxV28DriverFd = -1;
+static bool xboxV28ProbeRan = false;
+static u32 xboxV28Mask = 0;
 
-static inline bool XBOX_V27_Write(s32 fd, const u8 *packet, u16 packetLen,
-                                  u8 *buffer)
+static const char xboxV28VenPath[] ATTRIBUTE_ALIGN(32) = "/dev/usb/ven";
+
+/* Layout required in the first 64-byte vector for VEN IntrTransfer.
+ * Only offsets 0, 8, 12 and 14 are relevant to the IOS USB_VEN wrapper.
+ */
+static inline s32 XBOX_V28_DirectIntrOut(s32 venFd, s32 deviceId, u8 endpoint,
+                                        const u8 *packet, u16 packetLen,
+                                        u8 *args64, u8 *data64)
 {
-    memset(buffer, 0, 64);
-    memcpy(buffer, packet, packetLen);
-    s32 rc = USB_WriteIntrMsg(fd, XBOX_V27_OUT_EP, packetLen, buffer);
-    udelay(15000);
-    return rc >= 0;
+    memset(args64, 0, 64);
+    memset(data64, 0, 64);
+    memcpy(data64, packet, packetLen);
+
+    *(s32 *)(args64 + 0) = deviceId;
+    *(void **)(args64 + 8) = data64;
+    *(u16 *)(args64 + 12) = packetLen;
+    *(u8  *)(args64 + 14) = endpoint;
+
+    ioctlv vec[2];
+    vec[0].data = args64;
+    vec[0].len = 64;
+    vec[1].data = data64;
+    vec[1].len = packetLen;
+
+    return IOS_Ioctlv(venFd, V28_IOCTL_INTRMSG, 2, 0, vec);
 }
 
-static inline void XBOX_V27_ProbeEntries(u8 *buffer)
+static inline void XBOX_V28_RunProbe(void)
 {
-    static usb_device_entry entries[XBOX_V27_MAX_DEVICES] ATTRIBUTE_ALIGN(32);
-    memset(entries, 0, sizeof(entries));
-
-    u8 count = 0;
-    s32 listRc = USB_GetDeviceList(entries, XBOX_V27_MAX_DEVICES, 0xff, &count);
-    if (listRc < 0)
+    if (xboxV28ProbeRan)
         return;
+    xboxV28ProbeRan = true;
 
-    xboxV27Mask |= 0x0100;
-
-    static const u8 powerOn[] = { 0x05, 0x20, 0x00, 0x01, 0x00 };
-    int match = 0;
-
-    for (u8 i = 0; i < count && match < 3; ++i) {
-        if (entries[i].vid != XBOX_V27_VID || entries[i].pid != XBOX_V27_PID)
-            continue;
-
-        s32 probeFd = -1;
-        s32 openRc = USB_OpenDevice(entries[i].device_id, entries[i].vid,
-                                    entries[i].pid, &probeFd);
-        if (openRc >= 0 && probeFd != -1) {
-            if (match == 0) xboxV27Mask |= 0x0200;
-            if (match == 1) xboxV27Mask |= 0x0800;
-            if (match == 2) xboxV27Mask |= 0x2000;
-
-            if (XBOX_V27_Write(probeFd, powerOn, sizeof(powerOn), buffer)) {
-                if (match == 0) xboxV27Mask |= 0x0400;
-                if (match == 1) xboxV27Mask |= 0x1000;
-                if (match == 2) xboxV27Mask |= 0x4000;
-            }
-        }
-        match++;
-    }
-}
-
-static inline void XBOX_V27_RunProbe(s32 fd)
-{
-    if (xboxV27ProbeRan || fd == -1)
-        return;
-
-    xboxV27ProbeRan = true;
-
-    static const u8 powerOn[] = { 0x05, 0x20, 0x00, 0x01, 0x00 };
-    static const u8 oneSInit[] = { 0x05, 0x20, 0x01, 0x0f, 0x06 };
-
-    /* 128 bytes gives us one 64-byte transfer area and aligned scratch. */
-    u8 *block = (u8 *)SYS_AllocArenaMem2Lo(128, 32);
+    /* One allocation keeps every IOS-visible buffer in MEM2 and 32-byte aligned. */
+    u8 *block = (u8 *)SYS_AllocArenaMem2Lo(0x400, 32);
     if (!block)
         return;
+    xboxV28Mask |= 0x2000;
 
-    xboxV27Mask |= 0x8000;
-    u8 *buffer = block;
-    u8 *cfg = block + 64; /* 32-byte aligned */
+    u8 *ver      = block + 0x000; /* 0x20 */
+    u8 *listBuf  = block + 0x020; /* 0x180 */
+    u8 *cmd      = block + 0x1a0; /* 0x20 */
+    u8 *devInfo  = block + 0x1c0; /* 0xc0 */
+    u8 *args64   = block + 0x280; /* 0x40 */
+    u8 *data64   = block + 0x2c0; /* 0x40 */
 
-    /* Re-check the selected interface using correctly aligned storage. */
-    usb_devdesc desc;
-    memset(&desc, 0, sizeof(desc));
-    s32 descRc = USB_GetDescriptors(fd, &desc);
-    if (descRc >= 0) {
-        xboxV27Mask |= 0x0001;
-        USB_FreeDescriptors(&desc);
+    /* Sanity-check that libogc2 still sees the VEN list. */
+    static usb_device_entry sanity[32] ATTRIBUTE_ALIGN(32);
+    u8 sanityCount = 0;
+    memset(sanity, 0, sizeof(sanity));
+    if (USB_GetDeviceList(sanity, 32, 0xff, &sanityCount) >= 0)
+        xboxV28Mask |= 0x1000;
+
+    /* VEN interprets IOS_Open's mode as a handle ID. libogc2 owns handle 0;
+     * use handle 1 for an isolated lifecycle test.
+     */
+    s32 venFd = IOS_Open(xboxV28VenPath, 1);
+    if (venFd < 0)
+        return;
+    xboxV28Mask |= 0x0001;
+
+    memset(ver, 0, 0x20);
+    if (IOS_Ioctl(venFd, V28_IOCTL_GETVERSION, NULL, 0, ver, 0x20) == 0 &&
+        *(u32 *)ver == 0x00050001)
+        xboxV28Mask |= 0x0002;
+
+    memset(listBuf, 0, 0x180);
+    s32 listRc = IOS_Ioctl(venFd, V28_IOCTL_GETDEVICECHANGE,
+                           NULL, 0, listBuf, 0x180);
+    if (listRc < 0) {
+        IOS_Close(venFd);
+        return;
+    }
+    xboxV28Mask |= 0x0004;
+
+    usb_device_entry *entries = (usb_device_entry *)listBuf;
+    s32 targetId = -1;
+    int count = listRc;
+    if (count > 32) count = 32;
+
+    for (int i = 0; i < count; ++i) {
+        if (entries[i].vid == XBOX_V28_VID && entries[i].pid == XBOX_V28_PID) {
+            u8 interfaceNumber = (u8)((entries[i].token >> 8) & 0xff);
+            if (interfaceNumber == 0) {
+                targetId = entries[i].device_id;
+                xboxV28Mask |= 0x0008;
+                break;
+            }
+        }
     }
 
-    memset(cfg, 0, 32);
-    if (USB_GetConfiguration(fd, cfg) >= 0)
-        xboxV27Mask |= 0x0002;
+    if (targetId == -1) {
+        IOS_Ioctl(venFd, V28_IOCTL_ATTACHFINISH, NULL, 0, NULL, 0);
+        IOS_Close(venFd);
+        return;
+    }
 
-    /* Test every matching IOS58 entry before changing configuration. */
-    XBOX_V27_ProbeEntries(buffer);
+    /* Attach the interface to this VEN handle. */
+    memset(cmd, 0, 0x20);
+    *(s32 *)(cmd + 0) = targetId;
+    if (IOS_Ioctl(venFd, V28_IOCTL_ATTACH, cmd, 0x20, NULL, 0) >= 0)
+        xboxV28Mask |= 0x0010;
 
-    /* A working Wii XInput implementation configures the device before its
-     * operational interrupt-OUT command, so test that ordering explicitly. */
-    if (USB_SetConfiguration(fd, 1) >= 0)
-        xboxV27Mask |= 0x0004;
-    udelay(20000);
+    /* Resume: libogc2 writes the state in byte 11 via buf[2] on PPC. */
+    memset(cmd, 0, 0x20);
+    *(s32 *)(cmd + 0) = targetId;
+    ((s32 *)cmd)[2] = 1;
+    if (IOS_Ioctl(venFd, V28_IOCTL_SUSPEND_RESUME, cmd, 0x20, NULL, 0) >= 0)
+        xboxV28Mask |= 0x0020;
 
-    memset(cfg, 0, 32);
-    if (USB_GetConfiguration(fd, cfg) >= 0)
-        xboxV27Mask |= 0x0008;
+    /* GetDeviceInfo is documented as mandatory before using the device. */
+    memset(cmd, 0, 0x20);
+    *(s32 *)(cmd + 0) = targetId;
+    memset(devInfo, 0, 0xc0);
+    if (IOS_Ioctl(venFd, V28_IOCTL_GETDEVPARAMS,
+                  cmd, 0x20, devInfo, 0xc0) >= 0)
+        xboxV28Mask |= 0x0040;
 
-    if (XBOX_V27_Write(fd, powerOn, sizeof(powerOn), buffer))
-        xboxV27Mask |= 0x0010;
-    if (XBOX_V27_Write(fd, oneSInit, sizeof(oneSInit), buffer))
-        xboxV27Mask |= 0x0020;
+    static const u8 powerOn[]  = { 0x05, 0x20, 0x00, 0x01, 0x00 };
+    static const u8 oneSInit[] = { 0x05, 0x20, 0x01, 0x0f, 0x06 };
 
-    if (USB_SetAlternativeInterface(fd, 0, 0) >= 0)
-        xboxV27Mask |= 0x0040;
+    if (XBOX_V28_DirectIntrOut(venFd, targetId, XBOX_V28_OUT_EP,
+                               powerOn, sizeof(powerOn), args64, data64) >= 0)
+        xboxV28Mask |= 0x0080;
     udelay(15000);
 
-    if (XBOX_V27_Write(fd, powerOn, sizeof(powerOn), buffer))
-        xboxV27Mask |= 0x0080;
+    if (XBOX_V28_DirectIntrOut(venFd, targetId, XBOX_V28_OUT_EP,
+                               oneSInit, sizeof(oneSInit), args64, data64) >= 0)
+        xboxV28Mask |= 0x0100;
+    udelay(15000);
+
+    if (IOS_Ioctl(venFd, V28_IOCTL_ATTACHFINISH, NULL, 0, NULL, 0) >= 0)
+        xboxV28Mask |= 0x0200;
+
+    if (XBOX_V28_DirectIntrOut(venFd, targetId, XBOX_V28_OUT_EP,
+                               powerOn, sizeof(powerOn), args64, data64) >= 0)
+        xboxV28Mask |= 0x0400;
+
+    memset(cmd, 0, 0x20);
+    *(s32 *)(cmd + 0) = targetId;
+    if (IOS_Ioctl(venFd, V28_IOCTL_RELEASE, cmd, 0x20, NULL, 0) >= 0)
+        xboxV28Mask |= 0x0800;
+
+    IOS_Close(venFd);
 }
 
-static inline s32 XBOX_V27_USB_OpenDevice(s32 device_id, u16 vid, u16 pid, s32 *fd)
+static inline s32 XBOX_V28_USB_OpenDevice(s32 device_id, u16 vid, u16 pid, s32 *fd)
 {
     s32 rc = USB_OpenDevice(device_id, vid, pid, fd);
     if (rc < 0)
         return rc;
 
-    if (vid == XBOX_V27_VID && pid == XBOX_V27_PID && fd && *fd != -1) {
-        xboxV27Fd = *fd;
-        xboxV27ProbeRan = false;
-        xboxV27Mask = 0;
+    if (vid == XBOX_V28_VID && pid == XBOX_V28_PID && fd && *fd != -1) {
+        xboxV28DriverFd = *fd;
+        xboxV28ProbeRan = false;
+        xboxV28Mask = 0;
     }
-
     return rc;
 }
 
-static inline s32 XBOX_V27_USB_ReadIntrMsgAsync(s32 fd, u8 endpoint, u16 length,
+static inline s32 XBOX_V28_USB_ReadIntrMsgAsync(s32 fd, u8 endpoint, u16 length,
                                                  void *data, usbcallback cb,
                                                  void *userdata)
 {
-    /* Preserve xpad ordering: real IN request is queued before the probe. */
+    if (fd == xboxV28DriverFd && endpoint == XBOX_V28_IN_EP && !xboxV28ProbeRan)
+        XBOX_V28_RunProbe();
+
     s32 rc = USB_ReadIntrMsgAsync(fd, endpoint, length, data, cb, userdata);
 
-    if (fd == xboxV27Fd && endpoint == XBOX_V27_IN_EP && rc >= 0) {
-        XBOX_V27_RunProbe(fd);
-        return 27000 + (s32)xboxV27Mask;
-    }
+    if (fd == xboxV28DriverFd && endpoint == XBOX_V28_IN_EP && rc >= 0)
+        return 28000 + (s32)xboxV28Mask;
 
     return rc;
 }
 
-#define USB_OpenDevice       XBOX_V27_USB_OpenDevice
-#define USB_ReadIntrMsgAsync XBOX_V27_USB_ReadIntrMsgAsync
+#define USB_OpenDevice       XBOX_V28_USB_OpenDevice
+#define USB_ReadIntrMsgAsync XBOX_V28_USB_ReadIntrMsgAsync
 
 #endif
