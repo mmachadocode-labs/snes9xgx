@@ -1,158 +1,150 @@
 #ifdef HW_RVL
 
 /*
- * Wired Xbox One input for Snes9x GX.
+ * Wired Xbox One / Xbox One S input for Snes9x GX.
  *
- * Xbox One S 045e:02ea exposes three IOS58 /dev/usb/ven entries on the test
- * Wii. IOS58 V5 exposes each USB interface as a separate device_id. The raw
- * device-change entry also carries the interface number in usb_device_entry's
- * token field (raw byte 10 => token bits 15..8 on PPC).
+ * This driver talks directly to IOS58 /dev/usb/ven instead of using libogc's
+ * high-level V5 USB wrappers. The ownership/lifecycle follows the documented
+ * USB_VEN protocol:
  *
- * V23 confirmed interface 0 (FF/47/D0), interrupt IN 0x82 and OUT 0x02, but
- * every GIP interrupt-OUT completion still returned -7005/NAK.
+ *   Open handle -> GetDeviceChange -> Attach -> AttachFinish -> Resume
+ *   -> GetDeviceInfo -> queue interrupt IN -> send Xbox GIP init.
  *
- * V24 fixes an IOS58 V5 requirement that the application transfer buffers
- * passed to /dev/usb/ven live in MEM2 as well as being 32-byte aligned. The
- * previous static .bss buffers were aligned but normally lived in MEM1.
- * Both persistent async buffers are therefore reserved from Arena2/MEM2.
- *
- * USB_OpenDevice() in libogc2 resumes V5 VEN devices internally. The GIP
- * bring-up follows Linux xpad ordering: arm interrupt IN first, then send the
- * output init sequence asynchronously. NAKs are retried without closing the
- * controller. No filesystem logging is used.
+ * The Xbox One S GIP interface is FF/47/D0. Init packets and sequencing follow
+ * Linux xpad and the working WiiredX implementation: generic power-on first,
+ * then the 02EA-specific init packet. All IOS-visible buffers live in MEM2 and
+ * are 32-byte aligned; the first IntrTransfer vector is always 64 bytes.
  */
 
 #include <gccore.h>
+#include <ogc/ipc.h>
 #include <ogc/system.h>
-#include <ogc/usb.h>
-#include <malloc.h>
 #include <stdio.h>
 #include <string.h>
 
-#define MICROSOFT_VID 0x045e
-#define XBOX_ONE_S_PID 0x02ea
-#define USB_CLASS_VENDOR_SPECIFIC 0xff
-#define MAX_USB_DEVICES 24
-#define MAX_REPORT_SIZE 64
-#define POLL_INTERVAL_FRAMES 60
-#define RETRY_INTERVAL_FRAMES 15
-#define STICK_THRESHOLD 16384
-#define TRIGGER_THRESHOLD 128
-#define USB_NAK_RC (-7005)
-#define XBOX_GIP_INTERFACE 0
-#define XBOX_GIP_IN_EP 0x82
-#define XBOX_GIP_OUT_EP 0x02
+#define MICROSOFT_VID          0x045e
+#define XBOX_ONE_S_PID         0x02ea
 
-#define GIP_CMD_INPUT       0x20
-#define GIP_CMD_VIRTUAL_KEY 0x07
+#define GIP_IF_CLASS           0xff
+#define GIP_IF_SUBCLASS        0x47
+#define GIP_IF_PROTOCOL        0xd0
 
-typedef struct {
-    u16 pid;
-    const char *name;
-} xbox_profile;
+#define GIP_CMD_INPUT          0x20
+#define GIP_CMD_VIRTUAL_KEY    0x07
 
-static const xbox_profile profiles[] = {
-    { 0x02d1, "Xbox One" },
-    { 0x02dd, "Xbox One (2015)" },
-    { 0x02e3, "Xbox One Elite" },
-    { XBOX_ONE_S_PID, "Xbox One S" },
-    { 0x0b12, "Xbox Elite 2" },
-    { 0x0b13, "Xbox Series X/S" },
-};
+#define VEN_IOCTL_GETVERSION       0
+#define VEN_IOCTL_GETDEVICECHANGE  1
+#define VEN_IOCTL_GETDEVPARAMS     3
+#define VEN_IOCTL_ATTACH           4
+#define VEN_IOCTL_RELEASE          5
+#define VEN_IOCTL_ATTACHFINISH     6
+#define VEN_IOCTL_SUSPEND_RESUME  16
+#define VEN_IOCTL_CANCELENDPOINT  17
+#define VEN_IOCTL_INTRMSG         19
+
+#define MAX_REPORT_SIZE        64
+#define MAX_USB_DEVICES        32
+#define POLL_INTERVAL_FRAMES   60
+#define READ_RETRY_FRAMES       3
+#define STICK_THRESHOLD     16384
+#define TRIGGER_THRESHOLD      128
+#define USB_NAK_RC          (-7005)
+
+/* One permanent Arena2 allocation. Every address below is 32-byte aligned. */
+#define VEN_BLOCK_SIZE       0x500
+#define OFF_LIST             0x000 /* 0x180 */
+#define OFF_CMD              0x180 /* 0x020 */
+#define OFF_INFO             0x1a0 /* 0x0c0 */
+#define OFF_IN_HEADER        0x260 /* 0x040 */
+#define OFF_IN_DATA          0x2a0 /* 0x040 */
+#define OFF_OUT_HEADER       0x2e0 /* 0x040 */
+#define OFF_OUT_DATA         0x320 /* 0x040 */
+#define OFF_IN_VEC           0x360 /* 0x020 reserved */
+#define OFF_OUT_VEC          0x380 /* 0x020 reserved */
+#define OFF_VERSION          0x3a0 /* 0x020 */
+
+static const char venPath[] ATTRIBUTE_ALIGN(32) = "/dev/usb/ven";
 
 static bool initialized = false;
-static volatile bool active = false;
-static volatile bool closePending = false;
-static volatile s32 asyncError = 0;
-static volatile s32 deviceFd = -1; /* negative V5 ids are valid; -1 is sentinel */
-static const xbox_profile *activeProfile = NULL;
+static bool active = false;
+static int pollCountdown = 0;
+
+static s32 venFd = -1;
+static int venHandleId = -1;
+static s32 deviceId = -1;
 static u8 endpointIn = 0;
 static u8 endpointOut = 0;
 static u16 reportLength = MAX_REPORT_SIZE;
+static u8 outSequence = 1;
+
 static volatile u32 heldButtons = 0;
 static volatile bool guidePressed = false;
-static int pollCountdown = 0;
-static char statusText[192] = "not found";
-
-/* RAM-only diagnostics shown in Credits. */
-static s32 lastFd = -1;
-static u8 selectedListIndex = 0xff;
-static u8 selectedInterface = 0xff;
-static u8 selectedAltCount = 0xff;
-static u32 selectedToken = 0;
-static u8 matchingEntries = 0;
-static s32 lastReadQueueRc = 999;
-static volatile s32 lastWriteCompletionRc = 999;
-static s32 lastWriteSubmitRc = 999;
 static volatile u32 rxPackets = 0;
 static volatile u8 lastRxCommand = 0;
-static u32 initRetries = 0;
 
-/*
- * /dev/usb/ven requires application transfer buffers in MEM2 and 32-byte
- * aligned. Reserve one permanent 128-byte Arena2 block and split it into two
- * 64-byte buffers. Arena allocations are intentionally kept for app lifetime.
- */
-static u8 *usbBufferBlock = NULL;
-static u8 *reportBuffer = NULL;
-static u8 *outputBuffer = NULL;
+/* Lifecycle / transport diagnostics. */
+static s32 rcVersion = 999;
+static s32 rcList = 999;
+static s32 rcAttach = 999;
+static s32 rcAttachFinish = 999;
+static s32 rcResume = 999;
+static s32 rcDeviceInfo = 999;
+static s32 rcReadSubmit = 999;
+static s32 rcPower = 999;
+static s32 rcSpecial = 999;
+static volatile s32 rcReadComplete = 999;
+static char statusText[192] = "not found";
 
-/* xpad-style output init state. */
-static volatile bool writeInFlight = false;
-static volatile bool writeResultPending = false;
-static volatile s32 pendingWriteResult = 0;
-static int initStage = 0; /* 0 power, 1 One-S, 2 LED, 3 auth, 4 done */
-static u8 initSerial = 0;
-static int initRetryCountdown = 0;
+/* Persistent MEM2 buffers. */
+static u8 *venBlock = NULL;
+static u8 *deviceList = NULL;
+static u8 *cmdBuffer = NULL;
+static u8 *deviceInfo = NULL;
+static u8 *inHeader = NULL;
+static u8 *inData = NULL;
+static u8 *outHeader = NULL;
+static u8 *outData = NULL;
+static u8 *versionBuffer = NULL;
+static ioctlv *inVec = NULL;
+static ioctlv *outVec = NULL;
 
-static bool readRetryPending = false;
+/* Async read state. Callback only records state; all protocol work is main-loop. */
+static volatile bool readInFlight = false;
+static volatile bool readCompleted = false;
 static int readRetryCountdown = 0;
 
-static bool allocateUsbBuffers(void)
+static bool allocateVenBuffers(void)
 {
-    if (reportBuffer && outputBuffer)
+    if (venBlock)
         return true;
 
-    usbBufferBlock = (u8 *)SYS_AllocArenaMem2Lo(MAX_REPORT_SIZE * 2, 32);
-    if (!usbBufferBlock) {
-        snprintf(statusText, sizeof(statusText), "MEM2 USB buffer alloc failed");
+    venBlock = (u8 *)SYS_AllocArenaMem2Lo(VEN_BLOCK_SIZE, 32);
+    if (!venBlock)
         return false;
-    }
 
-    reportBuffer = usbBufferBlock;
-    outputBuffer = usbBufferBlock + MAX_REPORT_SIZE;
-    memset(reportBuffer, 0, MAX_REPORT_SIZE);
-    memset(outputBuffer, 0, MAX_REPORT_SIZE);
+    memset(venBlock, 0, VEN_BLOCK_SIZE);
+    deviceList   = venBlock + OFF_LIST;
+    cmdBuffer    = venBlock + OFF_CMD;
+    deviceInfo   = venBlock + OFF_INFO;
+    inHeader     = venBlock + OFF_IN_HEADER;
+    inData       = venBlock + OFF_IN_DATA;
+    outHeader    = venBlock + OFF_OUT_HEADER;
+    outData      = venBlock + OFF_OUT_DATA;
+    inVec        = (ioctlv *)(venBlock + OFF_IN_VEC);
+    outVec       = (ioctlv *)(venBlock + OFF_OUT_VEC);
+    versionBuffer = venBlock + OFF_VERSION;
     return true;
 }
 
-static const xbox_profile *findProfile(u16 vid, u16 pid)
+static void setCmdDevice(s32 id)
 {
-    if (vid != MICROSOFT_VID)
-        return NULL;
-
-    for (unsigned i = 0; i < sizeof(profiles) / sizeof(profiles[0]); ++i) {
-        if (profiles[i].pid == pid)
-            return &profiles[i];
-    }
-    return NULL;
+    memset(cmdBuffer, 0, 0x20);
+    *(s32 *)(cmdBuffer + 0) = id;
 }
 
-/*
- * IOS58 V5 GetDeviceChange entry bytes 8..11 are stored in entry->token:
- *   bytes 8..9  = device number
- *   byte 10     = interface number
- *   byte 11     = number of alternate settings
- * Wii/PPC is big-endian, hence interface is token bits 15..8.
- */
 static u8 entryInterfaceNumber(const usb_device_entry *entry)
 {
     return (u8)((entry->token >> 8) & 0xff);
-}
-
-static u8 entryAltCount(const usb_device_entry *entry)
-{
-    return (u8)(entry->token & 0xff);
 }
 
 static s16 readS16LE(const u8 *p)
@@ -165,6 +157,72 @@ static u16 readU16LE(const u8 *p)
     return (u16)p[0] | ((u16)p[1] << 8);
 }
 
+static s32 readCallback(s32 result, void *userdata)
+{
+    (void)userdata;
+    rcReadComplete = result;
+    readInFlight = false;
+    readCompleted = true;
+    return 0;
+}
+
+static void buildTransferHeader(u8 *header, u8 *data, u16 len, u8 endpoint)
+{
+    memset(header, 0, 64);
+    *(s32 *)(header + 0) = deviceId;
+    *(void **)(header + 8) = data;
+    *(u16 *)(header + 12) = len;
+    *(u8 *)(header + 14) = endpoint;
+}
+
+static s32 queueInterruptIn(void)
+{
+    if (venFd < 0 || deviceId == -1 || !endpointIn || readInFlight)
+        return IPC_EINVAL;
+
+    memset(inData, 0, MAX_REPORT_SIZE);
+    buildTransferHeader(inHeader, inData, reportLength, endpointIn);
+
+    /* IOS_IoctlvAsync temporarily converts vec[].data to physical addresses;
+     * set them fresh before every submission. IPC restores them on callback. */
+    inVec[0].data = inHeader;
+    inVec[0].len = 64;
+    inVec[1].data = inData;
+    inVec[1].len = reportLength;
+
+    s32 rc = IOS_IoctlvAsync(venFd, VEN_IOCTL_INTRMSG, 1, 1,
+                             inVec, readCallback, NULL);
+    rcReadSubmit = rc;
+    if (rc >= 0)
+        readInFlight = true;
+    return rc;
+}
+
+static s32 sendInterruptOut(const u8 *packet, u16 len, int seqOverride)
+{
+    if (venFd < 0 || deviceId == -1 || !endpointOut || !packet || !len)
+        return IPC_EINVAL;
+
+    memset(outData, 0, MAX_REPORT_SIZE);
+    memcpy(outData, packet, len);
+
+    if (seqOverride >= 0) {
+        outData[2] = (u8)seqOverride;
+    } else {
+        outData[2] = outSequence++;
+        if (outSequence == 0)
+            outSequence = 1;
+    }
+
+    buildTransferHeader(outHeader, outData, len, endpointOut);
+    outVec[0].data = outHeader;
+    outVec[0].len = 64;
+    outVec[1].data = outData;
+    outVec[1].len = len;
+
+    return IOS_Ioctlv(venFd, VEN_IOCTL_INTRMSG, 2, 0, outVec);
+}
+
 static void parseXboxOneReport(const u8 *d, u16 len)
 {
     if (!d || len < 5)
@@ -175,6 +233,16 @@ static void parseXboxOneReport(const u8 *d, u16 len)
 
     if (d[0] == GIP_CMD_VIRTUAL_KEY) {
         guidePressed = (d[4] & 0x01) != 0;
+
+        /* GIP virtual-key packets can request an ACK. WiiredX/xpad use the
+         * received sequence number in byte 2 of this 13-byte response. */
+        if (d[1] & 0x10) {
+            static const u8 ack[] = {
+                0x01, 0x20, 0x00, 0x09, 0x00, 0x07, 0x20,
+                0x02, 0x00, 0x00, 0x00, 0x00, 0x00
+            };
+            sendInterruptOut(ack, sizeof(ack), d[2]);
+        }
         return;
     }
 
@@ -185,11 +253,10 @@ static void parseXboxOneReport(const u8 *d, u16 len)
 
     if (d[4] & 0x04) buttons |= PAD_BUTTON_START;
     if (d[4] & 0x08) buttons |= PAD_TRIGGER_Z;
-
-    if (d[4] & 0x10) buttons |= PAD_BUTTON_B; /* Xbox A -> SNES B */
-    if (d[4] & 0x20) buttons |= PAD_BUTTON_A; /* Xbox B -> SNES A */
-    if (d[4] & 0x40) buttons |= PAD_BUTTON_Y; /* Xbox X -> SNES Y */
-    if (d[4] & 0x80) buttons |= PAD_BUTTON_X; /* Xbox Y -> SNES X */
+    if (d[4] & 0x10) buttons |= PAD_BUTTON_B; /* Xbox A -> Nintendo B */
+    if (d[4] & 0x20) buttons |= PAD_BUTTON_A; /* Xbox B -> Nintendo A */
+    if (d[4] & 0x40) buttons |= PAD_BUTTON_Y; /* Xbox X -> Nintendo Y */
+    if (d[4] & 0x80) buttons |= PAD_BUTTON_X; /* Xbox Y -> Nintendo X */
 
     if (d[5] & 0x01) buttons |= PAD_BUTTON_UP;
     if (d[5] & 0x02) buttons |= PAD_BUTTON_DOWN;
@@ -204,9 +271,9 @@ static void parseXboxOneReport(const u8 *d, u16 len)
         buttons |= PAD_TRIGGER_R;
 
     s16 lx = readS16LE(&d[10]);
-    s16 ly = (s16)~readS16LE(&d[12]);
+    s16 ly = (s16)-readS16LE(&d[12]);
     s16 rx = readS16LE(&d[14]);
-    s16 ry = (s16)~readS16LE(&d[16]);
+    s16 ry = (s16)-readS16LE(&d[16]);
 
     if (ly >  STICK_THRESHOLD) buttons |= PAD_BUTTON_UP;
     if (ly < -STICK_THRESHOLD) buttons |= PAD_BUTTON_DOWN;
@@ -220,406 +287,289 @@ static void parseXboxOneReport(const u8 *d, u16 len)
     heldButtons = buttons;
 }
 
-static s32 readCallback(s32 result, void *userdata)
+static bool parseGipInterface(void)
 {
-    (void)userdata;
-
-    if (result < 0) {
-        if (result == USB_NAK_RC) {
-            readRetryPending = true;
-            readRetryCountdown = RETRY_INTERVAL_FRAMES;
-        } else {
-            asyncError = result;
-            closePending = true;
-        }
-        return 0;
-    }
-
-    if (result > 0)
-        parseXboxOneReport(reportBuffer, (u16)result);
-
-    if (active && deviceFd != -1) {
-        s32 rc = USB_ReadIntrMsgAsync(deviceFd, endpointIn, reportLength,
-                                      reportBuffer, readCallback, NULL);
-        lastReadQueueRc = rc;
-        if (rc < 0) {
-            if (rc == USB_NAK_RC) {
-                readRetryPending = true;
-                readRetryCountdown = RETRY_INTERVAL_FRAMES;
-            } else {
-                asyncError = rc;
-                closePending = true;
-            }
-        }
-    }
-    return 0;
-}
-
-static s32 writeCallback(s32 result, void *userdata)
-{
-    (void)userdata;
-    lastWriteCompletionRc = result;
-    pendingWriteResult = result;
-    writeInFlight = false;
-    writeResultPending = true;
-    return 0;
-}
-
-static void closeController(void)
-{
-    s32 fd = deviceFd;
-    active = false;
-    deviceFd = -1;
-    writeInFlight = false;
-    writeResultPending = false;
-    readRetryPending = false;
-
-    if (fd != -1)
-        USB_CloseDevice(&fd);
-
-    activeProfile = NULL;
-    endpointIn = endpointOut = 0;
-    heldButtons = 0;
-    guidePressed = false;
-    closePending = false;
-}
-
-static bool prepareInitPacket(void)
-{
-    static const u8 powerOn[] = { 0x05, 0x20, 0x00, 0x01, 0x00 };
-    static const u8 oneSInit[] = { 0x05, 0x20, 0x00, 0x0f, 0x06 };
-    static const u8 ledOn[] = { 0x0a, 0x20, 0x00, 0x03, 0x00, 0x01, 0x14 };
-    static const u8 authDone[] = { 0x06, 0x20, 0x00, 0x02, 0x01, 0x00 };
-
-    const u8 *data = NULL;
-    u16 len = 0;
-
-    while (initStage < 4) {
-        switch (initStage) {
-            case 0:
-                data = powerOn;
-                len = sizeof(powerOn);
-                break;
-            case 1:
-                if (activeProfile && activeProfile->pid == XBOX_ONE_S_PID) {
-                    data = oneSInit;
-                    len = sizeof(oneSInit);
-                } else {
-                    initStage++;
-                    continue;
-                }
-                break;
-            case 2:
-                data = ledOn;
-                len = sizeof(ledOn);
-                break;
-            case 3:
-                data = authDone;
-                len = sizeof(authDone);
-                break;
-        }
-        break;
-    }
-
-    if (!data || !len || !outputBuffer)
+    /* USB_VEN GetDeviceInfo layout documented by WiiBrew:
+     *   interface descriptor at 52, endpoint descriptors at 64 (8-byte padded).
+     */
+    const u8 *iface = deviceInfo + 52;
+    if (iface[0] < 9 || iface[5] != GIP_IF_CLASS ||
+        iface[6] != GIP_IF_SUBCLASS || iface[7] != GIP_IF_PROTOCOL)
         return false;
 
-    memset(outputBuffer, 0, MAX_REPORT_SIZE);
-    memcpy(outputBuffer, data, len);
-    outputBuffer[2] = initSerial;
-    return true;
-}
-
-static void submitCurrentInitPacket(void)
-{
-    if (!active || deviceFd == -1 || !endpointOut || !outputBuffer ||
-        writeInFlight || initStage >= 4)
-        return;
-
-    if (!prepareInitPacket())
-        return;
-
-    u16 len = (initStage == 2) ? 7 : (initStage == 3) ? 6 : 5;
-    s32 rc = USB_WriteIntrMsgAsync(deviceFd, endpointOut, len,
-                                   outputBuffer, writeCallback, NULL);
-    lastWriteSubmitRc = rc;
-
-    if (rc >= 0) {
-        writeInFlight = true;
-    } else {
-        lastWriteCompletionRc = rc;
-        pendingWriteResult = rc;
-        writeResultPending = true;
-    }
-}
-
-static void processInitState(void)
-{
-    if (!active)
-        return;
-
-    if (writeResultPending) {
-        s32 rc = pendingWriteResult;
-        writeResultPending = false;
-
-        if (rc >= 0) {
-            initStage++;
-            initSerial++;
-            initRetries = 0;
-            initRetryCountdown = 1;
-        } else {
-            initRetries++;
-            initRetryCountdown = RETRY_INTERVAL_FRAMES;
-        }
-    }
-
-    if (writeInFlight || initStage >= 4)
-        return;
-
-    if (initRetryCountdown > 0) {
-        initRetryCountdown--;
-        return;
-    }
-
-    submitCurrentInitPacket();
-}
-
-static void processReadRetry(void)
-{
-    if (!active || !readRetryPending || deviceFd == -1 || !reportBuffer)
-        return;
-
-    if (readRetryCountdown > 0) {
-        readRetryCountdown--;
-        return;
-    }
-
-    memset(reportBuffer, 0, MAX_REPORT_SIZE);
-    s32 rc = USB_ReadIntrMsgAsync(deviceFd, endpointIn, reportLength,
-                                  reportBuffer, readCallback, NULL);
-    lastReadQueueRc = rc;
-
-    if (rc >= 0) {
-        readRetryPending = false;
-    } else if (rc == USB_NAK_RC) {
-        readRetryCountdown = RETRY_INTERVAL_FRAMES;
-    } else {
-        asyncError = rc;
-        closePending = true;
-    }
-}
-
-static void updateStatus(void)
-{
-    if (!active)
-        return;
-
-    snprintf(statusText, sizeof(statusText),
-             "x1s e:%u if:%u M2:%08x/%08x q:%d w:%d/%d s:%d n:%u rx:%u c:%02x",
-             (unsigned)selectedListIndex, (unsigned)selectedInterface,
-             (unsigned)(u32)reportBuffer, (unsigned)(u32)outputBuffer,
-             lastReadQueueRc, lastWriteSubmitRc,
-             (s32)lastWriteCompletionRc, initStage,
-             (unsigned)initRetries, (unsigned)rxPackets,
-             (unsigned)lastRxCommand);
-}
-
-static bool openSelectedEntry(const usb_device_entry *entry,
-                              const xbox_profile *profile,
-                              u8 interfaceNumber, u8 listIndex)
-{
-    s32 fd = -1;
-    s32 rc = USB_OpenDevice(entry->device_id, entry->vid, entry->pid, &fd);
-    lastFd = fd;
-    if (rc < 0) {
-        snprintf(statusText, sizeof(statusText),
-                 "open:%d e:%u if:%u t:%08x", rc,
-                 (unsigned)listIndex, (unsigned)interfaceNumber,
-                 (unsigned)entry->token);
-        return false;
-    }
-
-    deviceFd = fd;
-    activeProfile = profile;
-    endpointIn = XBOX_GIP_IN_EP;
-    endpointOut = XBOX_GIP_OUT_EP;
+    endpointIn = 0;
+    endpointOut = 0;
     reportLength = MAX_REPORT_SIZE;
-    selectedListIndex = listIndex;
-    selectedInterface = interfaceNumber;
-    selectedAltCount = entryAltCount(entry);
-    selectedToken = entry->token;
-    heldButtons = 0;
-    guidePressed = false;
-    asyncError = 0;
-    closePending = false;
-    active = true;
 
-    lastReadQueueRc = 999;
-    lastWriteSubmitRc = 999;
-    lastWriteCompletionRc = 999;
-    rxPackets = 0;
-    lastRxCommand = 0;
-    initRetries = 0;
-    initStage = 0;
-    initSerial = 0;
-    initRetryCountdown = 0;
-    writeInFlight = false;
-    writeResultPending = false;
-    readRetryPending = false;
-    readRetryCountdown = 0;
+    u8 numEndpoints = iface[4];
+    if (numEndpoints > 8)
+        numEndpoints = 8;
 
-    /* Linux xpad arms input before starting the Xbox One output init. */
-    memset(reportBuffer, 0, MAX_REPORT_SIZE);
-    rc = USB_ReadIntrMsgAsync(deviceFd, endpointIn, reportLength,
-                              reportBuffer, readCallback, NULL);
-    lastReadQueueRc = rc;
-    if (rc < 0) {
-        if (rc == USB_NAK_RC) {
-            readRetryPending = true;
-            readRetryCountdown = RETRY_INTERVAL_FRAMES;
-        } else {
-            snprintf(statusText, sizeof(statusText),
-                     "readq:%d e:%u if:%u t:%08x", rc,
-                     (unsigned)listIndex, (unsigned)interfaceNumber,
-                     (unsigned)entry->token);
-            closeController();
-            return false;
+    for (u8 i = 0; i < numEndpoints; ++i) {
+        const u8 *ep = deviceInfo + 64 + (i * 8);
+        if (ep[0] < 7 || (ep[3] & 0x03) != USB_ENDPOINT_INTERRUPT)
+            continue;
+
+        u8 address = ep[2];
+        u16 maxPacket = (u16)ep[4] | ((u16)ep[5] << 8);
+        if (address & USB_ENDPOINT_IN) {
+            if (!endpointIn) {
+                endpointIn = address;
+                if (maxPacket && maxPacket < reportLength)
+                    reportLength = maxPacket;
+            }
+        } else if (!endpointOut) {
+            endpointOut = address;
         }
     }
 
-    /* Keep input alive even if output initially NAKs. */
-    submitCurrentInitPacket();
-    updateStatus();
-    return true;
+    return endpointIn != 0 && endpointOut != 0;
 }
 
-static bool scanVendorClass(void)
+static void releaseCurrentDevice(void)
 {
-    usb_device_entry *entries = (usb_device_entry *)memalign(
-        32, sizeof(usb_device_entry) * MAX_USB_DEVICES);
-    if (!entries) {
-        snprintf(statusText, sizeof(statusText), "alloc list failed");
-        return false;
-    }
+    if (venFd < 0 || deviceId == -1 || !cmdBuffer)
+        return;
 
-    memset(entries, 0, sizeof(usb_device_entry) * MAX_USB_DEVICES);
-    u8 count = 0;
-    s32 rc = USB_GetDeviceList(entries, MAX_USB_DEVICES,
-                               USB_CLASS_VENDOR_SPECIFIC, &count);
-    if (rc < 0) {
-        snprintf(statusText, sizeof(statusText), "list:%d", rc);
-        free(entries);
-        return false;
-    }
+    setCmdDevice(deviceId);
+    IOS_Ioctl(venFd, VEN_IOCTL_RELEASE, cmdBuffer, 0x20, NULL, 0);
+    deviceId = -1;
+}
 
-    matchingEntries = 0;
-    u32 lastMatchingToken = 0;
-    u8 lastMatchingInterface = 0xff;
+static void closeVenHandle(void)
+{
+    if (venFd >= 0)
+        IOS_Close(venFd);
+    venFd = -1;
+    venHandleId = -1;
+}
 
-    for (u8 i = 0; i < count; ++i) {
-        const xbox_profile *profile = findProfile(entries[i].vid, entries[i].pid);
-        if (!profile)
-            continue;
+static void markDisconnected(void)
+{
+    active = false;
+    heldButtons = 0;
+    guidePressed = false;
+    readCompleted = false;
+    readInFlight = false;
+    endpointIn = endpointOut = 0;
+    releaseCurrentDevice();
+    closeVenHandle();
+    pollCountdown = POLL_INTERVAL_FRAMES;
+}
 
-        matchingEntries++;
-        u8 interfaceNumber = entryInterfaceNumber(&entries[i]);
-        lastMatchingToken = entries[i].token;
-        lastMatchingInterface = interfaceNumber;
+static bool openVenHandle(void)
+{
+    if (venFd >= 0)
+        return true;
 
-        /* Xbox One S GIP data interface is interface 0 (FF/47/D0). */
-        if (entries[i].pid == XBOX_ONE_S_PID &&
-            interfaceNumber != XBOX_GIP_INTERFACE)
-            continue;
-
-        if (openSelectedEntry(&entries[i], profile, interfaceNumber, i)) {
-            free(entries);
+    /* libogc normally owns handle id 0. USB_VEN supports 16 independent IDs. */
+    for (int handle = 1; handle < 16; ++handle) {
+        s32 fd = IOS_Open(venPath, (u32)handle);
+        if (fd >= 0) {
+            venFd = fd;
+            venHandleId = handle;
             return true;
         }
     }
-
-    if (matchingEntries)
-        snprintf(statusText, sizeof(statusText),
-                 "Xbox ifs:%u no if0 lastif:%u t:%08x",
-                 (unsigned)matchingEntries,
-                 (unsigned)lastMatchingInterface,
-                 (unsigned)lastMatchingToken);
-    else
-        snprintf(statusText, sizeof(statusText), "not found (%u USB)", count);
-
-    free(entries);
     return false;
 }
 
-static void initializeDriver(void)
+static bool tryConnect(void)
 {
-    if (initialized)
-        return;
-
-    initialized = true;
-    active = false;
-    deviceFd = -1;
-    heldButtons = 0;
-    closePending = false;
-    asyncError = 0;
-
-    if (!allocateUsbBuffers())
-        return;
-
-    s32 rc = USB_Initialize();
-    if (rc < 0) {
-        snprintf(statusText, sizeof(statusText), "USB init:%d", rc);
-        return;
+    if (!allocateVenBuffers() || !openVenHandle()) {
+        snprintf(statusText, sizeof(statusText), "not found VEN open");
+        return false;
     }
 
-    scanVendorClass();
-    pollCountdown = POLL_INTERVAL_FRAMES;
+    rcVersion = rcList = rcAttach = rcAttachFinish = 999;
+    rcResume = rcDeviceInfo = rcReadSubmit = 999;
+    rcPower = rcSpecial = rcReadComplete = 999;
+    heldButtons = 0;
+    rxPackets = 0;
+    lastRxCommand = 0;
+    outSequence = 1;
+
+    memset(versionBuffer, 0, 0x20);
+    rcVersion = IOS_Ioctl(venFd, VEN_IOCTL_GETVERSION,
+                          NULL, 0, versionBuffer, 0x20);
+    if (rcVersion < 0 || *(u32 *)versionBuffer != 0x00050001)
+        goto fail;
+
+    memset(deviceList, 0, 0x180);
+    rcList = IOS_Ioctl(venFd, VEN_IOCTL_GETDEVICECHANGE,
+                       NULL, 0, deviceList, 0x180);
+    if (rcList < 0)
+        goto fail;
+
+    usb_device_entry *entries = (usb_device_entry *)deviceList;
+    int count = rcList;
+    if (count > MAX_USB_DEVICES)
+        count = MAX_USB_DEVICES;
+
+    deviceId = -1;
+    for (int i = 0; i < count; ++i) {
+        if (entries[i].vid == MICROSOFT_VID &&
+            entries[i].pid == XBOX_ONE_S_PID &&
+            entryInterfaceNumber(&entries[i]) == 0) {
+            deviceId = entries[i].device_id;
+            break;
+        }
+    }
+
+    if (deviceId == -1)
+        goto fail;
+
+    /* Claim the GIP interface while handling the device-list snapshot, then
+     * complete the attach phase before normal device operations. */
+    setCmdDevice(deviceId);
+    rcAttach = IOS_Ioctl(venFd, VEN_IOCTL_ATTACH,
+                         cmdBuffer, 0x20, NULL, 0);
+    if (rcAttach < 0)
+        goto fail;
+
+    rcAttachFinish = IOS_Ioctl(venFd, VEN_IOCTL_ATTACHFINISH,
+                               NULL, 0, NULL, 0);
+    /* On the initial immediate GetDeviceChange reply there may be no manager
+     * lock to release, so EINVAL here is not fatal after a successful Attach. */
+
+    setCmdDevice(deviceId);
+    ((s32 *)cmdBuffer)[2] = 1; /* byte 11 = resume state on big-endian PPC */
+    rcResume = IOS_Ioctl(venFd, VEN_IOCTL_SUSPEND_RESUME,
+                         cmdBuffer, 0x20, NULL, 0);
+    /* EINVAL also means "already in requested state". GetDeviceInfo is the
+     * authoritative next check, so do not fail solely on rcResume == -4. */
+
+    setCmdDevice(deviceId);
+    memset(deviceInfo, 0, 0xc0);
+    rcDeviceInfo = IOS_Ioctl(venFd, VEN_IOCTL_GETDEVPARAMS,
+                             cmdBuffer, 0x20, deviceInfo, 0xc0);
+    if (rcDeviceInfo < 0 || !parseGipInterface())
+        goto fail;
+
+    /* Match Linux xpad ordering: arm interrupt IN before GIP output init. */
+    readCompleted = false;
+    readInFlight = false;
+    rcReadSubmit = queueInterruptIn();
+    if (rcReadSubmit < 0)
+        goto fail;
+
+    static const u8 powerOn[] = { 0x05, 0x20, 0x00, 0x01, 0x00 };
+    static const u8 oneSInit[] = { 0x05, 0x20, 0x00, 0x0f, 0x06 };
+
+    rcPower = sendInterruptOut(powerOn, sizeof(powerOn), -1);
+    if (rcPower < 0)
+        goto fail_pending_read;
+
+    rcSpecial = sendInterruptOut(oneSInit, sizeof(oneSInit), -1);
+    if (rcSpecial < 0)
+        goto fail_pending_read;
+
+    active = true;
+    snprintf(statusText, sizeof(statusText),
+             "connected VEN h:%d ep:%02x/%02x q:%d p:%d/%d rx:%u c:%02x",
+             venHandleId, endpointIn, endpointOut, rcReadSubmit,
+             rcPower, rcSpecial, (unsigned)rxPackets,
+             (unsigned)lastRxCommand);
+    return true;
+
+fail_pending_read:
+    /* Keep ownership/handle alive for diagnostics if the controller NAKs the
+     * documented GIP sequence. The pending IN request is harmless and gives us
+     * one more useful signal (whether any packet arrives). */
+    active = false;
+    snprintf(statusText, sizeof(statusText),
+             "not found VEN h:%d a:%d f:%d r:%d d:%d q:%d p:%d/%d",
+             venHandleId, rcAttach, rcAttachFinish, rcResume, rcDeviceInfo,
+             rcReadSubmit, rcPower, rcSpecial);
+    return false;
+
+fail:
+    snprintf(statusText, sizeof(statusText),
+             "not found VEN h:%d v:%d l:%d a:%d f:%d r:%d d:%d",
+             venHandleId, rcVersion, rcList, rcAttach, rcAttachFinish,
+             rcResume, rcDeviceInfo);
+    if (deviceId != -1)
+        releaseCurrentDevice();
+    closeVenHandle();
+    return false;
 }
 
 void XBOXONE_ScanPads(void)
 {
-    initializeDriver();
-
-    if (closePending) {
-        s32 err = asyncError;
-        closeController();
-        snprintf(statusText, sizeof(statusText),
-                 "usbcb:%d fd:%d q:%d w:%d/%d",
-                 err, lastFd, lastReadQueueRc,
-                 lastWriteSubmitRc, (s32)lastWriteCompletionRc);
+    if (!initialized) {
+        initialized = true;
+        if (!allocateVenBuffers()) {
+            snprintf(statusText, sizeof(statusText), "not found VEN MEM2");
+            return;
+        }
         pollCountdown = 0;
     }
 
-    if (active) {
-        processReadRetry();
-        processInitState();
-        updateStatus();
+    if (!active) {
+        /* If a documented GIP OUT failed after IN was queued, preserve that
+         * state for Credits instead of repeatedly tearing down the same probe. */
+        if (readInFlight)
+            return;
+
+        if (pollCountdown > 0) {
+            pollCountdown--;
+            return;
+        }
+
+        if (!tryConnect())
+            pollCountdown = POLL_INTERVAL_FRAMES;
         return;
     }
 
-    if (--pollCountdown > 0)
-        return;
+    if (readCompleted) {
+        s32 result = rcReadComplete;
+        readCompleted = false;
 
-    pollCountdown = POLL_INTERVAL_FRAMES;
-    scanVendorClass();
+        if (result > 0) {
+            u16 len = (result > MAX_REPORT_SIZE) ? MAX_REPORT_SIZE : (u16)result;
+            parseXboxOneReport(inData, len);
+            readRetryCountdown = 0;
+        } else if (result == USB_NAK_RC) {
+            readRetryCountdown = READ_RETRY_FRAMES;
+        } else if (result < 0) {
+            markDisconnected();
+            snprintf(statusText, sizeof(statusText),
+                     "not found VEN read:%d", result);
+            return;
+        }
+    }
+
+    if (!readInFlight) {
+        if (readRetryCountdown > 0) {
+            readRetryCountdown--;
+        } else {
+            s32 rc = queueInterruptIn();
+            if (rc < 0 && rc != USB_NAK_RC) {
+                markDisconnected();
+                snprintf(statusText, sizeof(statusText),
+                         "not found VEN queue:%d", rc);
+                return;
+            }
+        }
+    }
+
+    snprintf(statusText, sizeof(statusText),
+             "connected VEN h:%d ep:%02x/%02x q:%d p:%d/%d rr:%d rx:%u c:%02x",
+             venHandleId, endpointIn, endpointOut, rcReadSubmit,
+             rcPower, rcSpecial, (s32)rcReadComplete,
+             (unsigned)rxPackets, (unsigned)lastRxCommand);
 }
 
 u32 XBOXONE_ButtonsHeld(int chan)
 {
-    if (!initialized)
-        initializeDriver();
-
-    if (!active || chan != 0)
+    if (chan != 0 || !active)
         return 0;
-
     return heldButtons;
 }
 
 char *XBOXONE_Status(void)
 {
-    if (!initialized)
-        initializeDriver();
-    updateStatus();
     return statusText;
 }
 
-#endif
+#endif /* HW_RVL */
