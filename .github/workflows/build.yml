@@ -41,6 +41,35 @@ jobs:
           make -f Makefile.platform wiiu_install
         fi
 
+    - name: Build Xbox One S USB input tester
+      if: ${{ matrix.image == 'Wii' }}
+      run: |
+        make -C tools/xbox-usb-test -j3
+
+    - name: Package Xbox One S USB input tester
+      if: ${{ matrix.image == 'Wii' }}
+      run: |
+        mkdir -p dist/XboxOneS-USB-Test/apps/xbox-one-s-usb-test
+        cp tools/xbox-usb-test/xbox-one-s-usb-test.dol dist/XboxOneS-USB-Test/apps/xbox-one-s-usb-test/boot.dol
+        cat > dist/XboxOneS-USB-Test/apps/xbox-one-s-usb-test/meta.xml <<'EOF'
+        <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        <app version="1">
+          <name>Xbox One S USB Input Test</name>
+          <coder>mmachadocode-labs</coder>
+          <version>1.0</version>
+          <short_description>Xbox One S USB/GIP diagnostic</short_description>
+          <long_description>Detects Microsoft 045e:02ea, sends Xbox One GIP init packets and displays live buttons, triggers, sticks and raw USB input.</long_description>
+        </app>
+        EOF
+
+    - name: Upload Xbox One S USB input tester
+      uses: actions/upload-artifact@v4
+      if: ${{ matrix.image == 'Wii' }}
+      with:
+        name: XboxOneS-USB-Test
+        path: |
+          dist/XboxOneS-USB-Test/
+
     - name: Build Wii
       if: ${{ matrix.image == 'Wii' }}
       run: |
