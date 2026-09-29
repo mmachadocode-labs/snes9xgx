@@ -1,0 +1,41 @@
+name: Xbox USB Standalone Test
+
+on:
+  push:
+    branches: ["xbox-usb-test"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Wii tester
+    runs-on: ubuntu-latest
+    container: ghcr.io/extremscorner/libogc2:latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Build standalone tester
+      run: |
+        cd tools/xbox-usb-test
+        make -j2
+
+    - name: Prepare artifact
+      run: |
+        mkdir -p dist/Xbox-USB-Test/apps/xbox-usb-test
+        cp tools/xbox-usb-test/xbox-usb-test.dol dist/Xbox-USB-Test/apps/xbox-usb-test/boot.dol
+        cat > dist/Xbox-USB-Test/apps/xbox-usb-test/meta.xml <<'EOF'
+        <app version="1">
+          <name>Xbox USB Test</name>
+          <coder>Mauricio Machado / OpenAI</coder>
+          <version>0.1</version>
+          <short_description>Standalone Xbox One S USB diagnostic</short_description>
+          <long_description>Tests IOS58 /dev/usb/ven ownership, descriptors, endpoints and GIP traffic for Microsoft 045e:02ea.</long_description>
+        </app>
+        EOF
+
+    - name: Upload tester
+      uses: actions/upload-artifact@v4
+      with:
+        name: Xbox-USB-Test-Wii
+        path: dist/Xbox-USB-Test/
